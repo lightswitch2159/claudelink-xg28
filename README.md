@@ -83,14 +83,24 @@ project, built and eventually generated through Simplicity Studio 6.
      has no reason to reimplement. `sl_rail_util_get_handle(SL_RAIL_UTIL_HANDLE_INST0)`
      retrieves the resulting handle afterward.
 
+  Resolved since the last commit:
+
+  - **The event callback wiring question is settled.** Read
+    `autogen/sl_rail_util_callbacks.c` directly: `sl_rail_util_on_event()`
+    is declared `__WEAK` there with an empty default body, and that file's
+    own header warns "any application code placed within this file will be
+    discarged upon project regeneration" -- the intended pattern is a
+    weak-symbol override living outside `autogen/`, not editing the
+    generated file or manually chaining callbacks. The driver's handler is
+    now literally named `sl_rail_util_on_event()` with external linkage, so
+    the linker uses it in place of the weak stub. No registration call
+    needed. `RAIL_ConfigEvents()` in `sl_subg_radio_init()` is still
+    required separately -- it controls which event bits are unmasked, not
+    which function receives them, and those are genuinely two different
+    questions.
+
   Real, still-open gaps, marked rather than papered over:
 
-  - This driver's own `rail_events_callback()` is defined but **not actually
-    wired into RAIL's dispatch** -- `sl_rail_util_init()` installs its own
-    internal callback (`sli_rail_util_on_event`) as part of bring-up, and
-    this driver's handler is not yet chained into that. Without resolving
-    this, the FIFO-drain-on-event logic the whole receive path depends on
-    simply never runs.
   - `RAIL_SetRxFifo()`'s exact parameter order was checked this time
     (`RAIL_Handle_t, uint8_t *addr, uint16_t *size`) -- confirmed, not
     assumed.

@@ -76,16 +76,21 @@ static void wait_for_rx_data_or_timeout(uint32_t timeout_ms)
  * "terminate on a sentinel byte, do not wait for the radio's own notion of
  * packet-complete" behaviour.
  *
- * TODO: this needs to be wired into RAIL_Config_t::eventsCallback. The
- * generated sl_rail_util_init_inst0() already installs its OWN callback
- * (sli_rail_util_on_event) as part of bring-up -- this driver's callback is
- * not yet hooked into that chain. Either this function needs to be called
- * from inside sli_rail_util_on_event (not ours to edit, it is generated), or
- * RAIL_ConfigEvents() needs to be re-armed with our own handler after
- * sl_rail_util_init() completes. Not resolved yet -- flagged rather than
- * silently assumed to work.
+ * WIRING, RESOLVED: this function is deliberately named sl_rail_util_on_event
+ * and given external (non-static) linkage to override a __WEAK stub of the
+ * same name in the generated autogen/sl_rail_util_callbacks.c -- confirmed by
+ * reading that file directly. Its own internal sli_rail_util_on_event(),
+ * which IS what sl_rail_util_init() wires into RAIL_Config_t::eventsCallback,
+ * does nothing but call sl_rail_util_on_event(); the weak default is an empty
+ * stub, and that generated file's own header warns "any application code
+ * placed within this file will be discarged upon project regeneration" --
+ * i.e. the intended pattern really is a weak-symbol override living outside
+ * autogen/, not editing the generated file. No manual callback chaining or
+ * re-arming needed. RAIL_ConfigEvents() in sl_subg_radio_init() below is
+ * still required, separately -- it controls which event bits are unmasked at
+ * the radio, not which function receives them.
  */
-static void rail_events_callback(RAIL_Handle_t handle, RAIL_Events_t events)
+void sl_rail_util_on_event(RAIL_Handle_t handle, RAIL_Events_t events)
 {
 	if (events & RAIL_EVENT_RX_FIFO_ALMOST_FULL) {
 		while (s_rx_count < SL_SUBG_MAX_PKT_LEN) {
@@ -162,12 +167,9 @@ int sl_subg_radio_init(void)
 		return -1;
 	}
 
-	/* TODO: see rail_events_callback()'s comment -- this driver's callback is
-	 * not yet actually reachable from RAIL's dispatch. sl_rail_util_init()
-	 * installs its own eventsCallback internally; ours needs to be chained in,
-	 * not just defined.
+	/* sl_rail_util_on_event() above overrides the generated weak stub by
+	 * symbol name -- nothing to call or register here.
 	 */
-	(void)rail_events_callback;
 
 	return 0;
 }
