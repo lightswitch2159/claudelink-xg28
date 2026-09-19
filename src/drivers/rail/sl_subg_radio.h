@@ -10,27 +10,62 @@
  * OPERATIONS subg.c actually needs (init, send, receive-with-timeout, RSSI,
  * power), matching rf69.h's role in the system rather than its shape.
  *
- * API FAMILY, CORRECTED ONCE ALREADY: this uses RAIL_* (PascalCase), not the
- * newer sl_rail_* family. The header comments in this SDK mark RAIL_Init /
- * RAIL_StartTx / RAIL_StartRx / RAIL_ConfigChannels @deprecated, and an
- * earlier version of this file was written against sl_rail_* on that basis.
- * That was wrong: Simplicity Studio's own Radio Configurator generates
- * RAIL_ChannelConfig_t (not sl_rail_channel_config_t) for this exact project,
- * and its own generated init glue
- * (SimplicityStudio/v6_workspace/rail_soc_railtest/autogen/sl_rail_util_init.c)
- * calls RAIL_Init/RAIL_ConfigData/RAIL_ConfigChannels throughout -- not one
- * sl_rail_* call anywhere in it. The deprecation tags are real, but this
- * project template is built on the "deprecated" API regardless, and passing
- * the generated channel config to sl_rail_config_channels() would be a type
- * mismatch (sl_rail_channel_config_t != RAIL_ChannelConfig_t) even if it
- * compiled. Verified by reading the actual generated files, not asserted.
+ * API FAMILY, CORRECTED A SECOND TIME -- this is now sl_rail_* (lowercase),
+ * not RAIL_*. Two real, conflicting pieces of generated evidence exist in
+ * this repo's history, and the discriminator turned out to be WHICH SDK
+ * component a project pulls in, not a global SDK-wide answer:
+ *
+ *   - rail_soc_railtest (RAIL - SoC RAILtest example) pulls in component id
+ *     `rail_util_init` and its generated autogen/sl_rail_util_init.c calls
+ *     RAIL_Init/RAIL_ConfigChannels throughout -- confirmed by reading that
+ *     file directly, which is what the driver was first (correctly, for that
+ *     project) written against.
+ *   - rail_bt_dmp_soc_range_test (RAIL Bluetooth DMP - SoC Range Test
+ *     example, generated for BRD2705A this session) pulls in a
+ *     DIFFERENTLY-NAMED component, `sl_rail_util_init`, whose generated
+ *     autogen/sl_rail_util_callbacks.c defines a REAL (not commented-out)
+ *     sl_rail_util_on_event(sl_rail_handle_t, sl_rail_events_t) as the weak
+ *     stub this driver's callback overrides, and autogen/sl_rail_util_init.h
+ *     declares sl_rail_util_get_handle() returning sl_rail_handle_t. This is
+ *     the DMP-shaped project this driver actually needs to integrate with, so
+ *     this rewrite follows it.
+ *
+ * Every sl_rail_*() signature below (set_tx_fifo/set_rx_fifo/write_tx_fifo/
+ * read_rx_fifo/start_tx/start_rx/idle/get_rssi/set_tx_power_dbm/
+ * config_events) was checked against the real header in this exact project's
+ * own copied SDK
+ * (SimplicityStudio/v6_workspace/rail_bt_dmp_soc_range_test/simplicity_sdk_2026.6.1/rail_library/common/sl_rail.h),
+ * not recalled from memory or extrapolated from the RAIL_* names. Some
+ * signatures genuinely differ beyond casing -- notably sl_rail_get_rssi()
+ * takes a microsecond wait_timeout, not the RAIL_GetRssi() bool wait flag it
+ * replaces, and sl_rail_set_tx_fifo()/sl_rail_set_rx_fifo() take a
+ * sl_rail_fifo_buffer_align_t* (a plain uint32_t alias, per sl_rail_types.h,
+ * requiring the FIFO buffers below to be word-array-typed) rather than a bare
+ * uint8_t*.
+ *
+ * RTOS, CORRECTED ALONGSIDE THIS: Micrium OS, not FreeRTOS. The FreeRTOS
+ * event-group rewrite from the previous commit assumed the sanctioned RTOS
+ * for ANY Bluetooth+RAIL DMP project on this SDK was FreeRTOS, based on the
+ * bt_rail_dmp_soc_empty example (which does offer independent FreeRTOS and
+ * Micrium OS project variants). That does not generalize: this project's own
+ * manifest (rail_bt_dmp_soc_range_test.slcp) selects the RTOS by silicon
+ * series --
+ *     id: micriumos_kernel, condition: [device_series_2]
+ *     id: freertos,         condition: [device_series_3]
+ * -- and the EFR32xG28 is Series 2, so Studio generated this project against
+ * Micrium OS, with no FreeRTOS option available for this exact chip in this
+ * exact example. Confirmed by reading the real .slcp, not inferred. The wait
+ * primitives below use OSFlagPend/OSFlagPost (event flags) and, in aps.c,
+ * OSQPend/OSQPost/OSTaskCreate -- real signatures checked against
+ * .../simplicity_sdk_2026.6.1/micriumos/platform/micrium_os/kernel/include/os.h
+ * in this same project.
  *
  * Bring-up should call the generated sl_rail_util_init() (declared in
- * autogen/sl_rail_util_init.h) rather than reimplement RAIL_Init +
- * RAIL_ConfigChannels by hand -- it is Silicon Labs' own tested glue, already
- * wired to the real MDT_OOK channel config (autogen/rail_config.c), and
- * retrieving the resulting handle via sl_rail_util_get_handle() avoids
- * duplicating what it already does correctly.
+ * autogen/sl_rail_util_init.h) rather than reimplement sl_rail_init() +
+ * sl_rail_config_channels() by hand -- it is Silicon Labs' own tested glue,
+ * already wired to the real channel config, and retrieving the resulting
+ * handle via sl_rail_util_get_handle() avoids duplicating what it already
+ * does correctly.
  */
 
 #ifndef ORANGELINK_SL_SUBG_RADIO_H_
@@ -58,8 +93,8 @@ extern "C" {
  * protocol layer (src/aps/aps.c, ported from the legacy RileyLink command set)
  * asks for an arbitrary frequency in Hz, computed from three CC111x-style
  * register bytes the host sends -- there is no RAIL call that tunes to an
- * arbitrary Hz value directly, only RAIL_StartTx/RAIL_StartRx(channel). So
- * sl_subg_set_freq() maps the requested Hz onto the nearest in-range channel
+ * arbitrary Hz value directly, only sl_rail_start_tx/sl_rail_start_rx(channel).
+ * So sl_subg_set_freq() maps the requested Hz onto the nearest in-range channel
  * of this same static config, rather than reconfiguring the PHY.
  */
 #define SL_SUBG_BASE_FREQ_HZ 916000000U
@@ -111,11 +146,12 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
  * RFM69 declares a generous upper bound and drains the FIFO incrementally via
  * the DIO1/FifoNotEmpty interrupt, watching for the 0x00 terminator itself
  * and stopping long before the radio's own length counter would complete.
- * The RAIL equivalent of that interrupt is RAIL_EVENT_RX_FIFO_ALMOST_FULL
- * (confirmed present in rail_types.h this session), delivered through the
- * RAIL_Config_t::eventsCallback set up by the generated init code -- so this
- * function is implemented the same way: start_rx(), drain on that event via
- * RAIL_ReadRxFifo(), terminate on 0x00, RAIL_Idle() when done.
+ * The RAIL equivalent of that interrupt is SL_RAIL_EVENT_RX_FIFO_ALMOST_FULL
+ * (confirmed present in sl_rail_types.h this session, real generated project
+ * -- see the file banner), delivered through the callback the generated init
+ * code wires up -- so this function is implemented the same way: start_rx(),
+ * drain on that event via sl_rail_read_rx_fifo(), terminate on 0x00,
+ * sl_rail_idle() when done.
  */
 enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len,
 				       uint32_t timeout_ms);
@@ -125,27 +161,29 @@ void sl_subg_abort(void);
 void sl_subg_clear_abort(void);
 
 /**
- * @brief Last measured reply RSSI, dBm. Maps directly onto RAIL_GetRssi() --
- * unlike the RFM69 port, no first-byte-latch workaround should be needed,
- * since RAIL reports genuine per-packet RSSI rather than a live, freely
- * drifting register (see MIGRATION_NOTES.md section 21 on why that workaround
- * existed at all on the RFM69).
+ * @brief Last measured reply RSSI, dBm. Maps onto sl_rail_get_rssi() -- which
+ * takes a microsecond wait_timeout parameter, not a bool, unlike the RAIL_*
+ * family's RAIL_GetRssi() this replaced (see the file banner). Unlike the
+ * RFM69 port, no first-byte-latch workaround should be needed, since RAIL
+ * reports genuine per-packet RSSI rather than a live, freely drifting
+ * register (see MIGRATION_NOTES.md section 21 on why that workaround existed
+ * at all on the RFM69).
  */
 int16_t sl_subg_get_last_rssi(void);
 
 /**
  * @brief Set transmit power, in whole dBm.
  *
- * Grounded this session against the real rail.h: RAIL_SetTxPowerDbm(handle,
- * RAIL_TxPower_t power) takes DECI-dBm (rail_types.h: typedef int16_t
- * RAIL_TxPower_t; see the RAIL_SetTxPowerDbm doc comment's own example, "100
- * deci-dBm, 10 dBm"). This function takes whole dBm and multiplies by 10 --
- * unlike the RFM69 driver's rf69_set_power_level(), which takes a raw PA
- * register value (0-31), so callers porting from subg.c cannot reuse the old
- * constants (SUBG_PA_LEVEL_MIN/DEFAULT) unchanged; see aps.c/subg equivalent
- * for the new call sites. Requires RAIL_ConfigTxPower() to have already run,
- * which the generated sl_rail_util_init() is expected to do -- not
- * independently confirmed against this exact project's autogen output.
+ * Grounded against the real sl_rail.h in this project's own copied SDK:
+ * sl_rail_set_tx_power_dbm(handle, sl_rail_tx_power_t power_ddbm) takes
+ * DECI-dBm (sl_rail_types.h: typedef int16_t sl_rail_tx_power_t). This
+ * function takes whole dBm and multiplies by 10 -- unlike the RFM69 driver's
+ * rf69_set_power_level(), which takes a raw PA register value (0-31), so
+ * callers porting from subg.c cannot reuse the old constants
+ * (SUBG_PA_LEVEL_MIN/DEFAULT) unchanged; see aps.c's equivalent call sites.
+ * Requires TX power to have already been configured during
+ * sl_rail_util_init() -- not independently confirmed against this exact
+ * project's autogen output.
  */
 int sl_subg_set_power_level(int16_t dbm);
 

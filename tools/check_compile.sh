@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Syntax-check the driver and encoding layer against the real project's exact
+# Syntax-check the driver and protocol layer against the real project's exact
 # build configuration -- no linking, no hardware, but it exercises every
-# header include and every RAIL_*() call site for real.
+# header include and every sl_rail_*()/OS*() call site for real.
 #
 # Requires a Simplicity Studio project generated for this exact board
 # (xG28-EK2705A / BRD2705A) sitting somewhere on disk -- point STUDIO_PROJECT
@@ -9,10 +9,22 @@
 # own generated cmake_gcc/<project>.cmake, not hand-maintained here, so it
 # stays correct as Studio regenerates the project.
 #
+# Default project: rail_bt_dmp_soc_range_test ("RAIL Bluetooth DMP - SoC
+# Range Test"), the real Bluetooth+RAIL DMP example generated for BRD2705A --
+# NOT rail_soc_railtest (a bare RAIL-only project, no Bluetooth/RTOS, used
+# earlier for the encoding-layer/first-driver-skeleton checks and kept as the
+# reference that resolved the RAIL_*-vs-sl_rail_* question the OTHER way for
+# that project shape; see sl_subg_radio.c's file banner for the full trail).
+# This project pulls in Micrium OS (device_series_2 in its own .slcp), not
+# FreeRTOS -- an earlier version of this script carried a whole separate
+# section hunting down FreeRTOS headers and borrowing rail_soc_railtest's
+# include set as a workaround; that's gone now that a real DMP project with
+# its own RTOS in its own generated cmake_gcc/*.cmake exists on disk.
+#
 # SPDX-License-Identifier: GPL-2.0-only
 set -euo pipefail
 
-STUDIO_PROJECT="${1:-$HOME/SimplicityStudio/v6_workspace/rail_soc_railtest}"
+STUDIO_PROJECT="${1:-$HOME/SimplicityStudio/v6_workspace/rail_bt_dmp_soc_range_test}"
 PROJECT_NAME="$(basename "$STUDIO_PROJECT")"
 CMAKE_FILE="$STUDIO_PROJECT/cmake_gcc/${PROJECT_NAME}.cmake"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -76,41 +88,9 @@ PYEOF
 CFLAGS=(-fsyntax-only -mcpu=cortex-m33 -mthumb -mfpu=fpv5-sp-d16 -mfloat-abi=hard -mcmse
         -Wall -Wextra -Og --specs=nano.specs)
 
-# FreeRTOS headers, found under the same conan package tree as the toolchain
-# search above rather than hardcoded to one hash (that hash changes across SDK
-# updates). Used by both sl_subg_radio.c (event-group waits) and aps.c
-# (task/queue dispatch) -- see the RTOS note in sl_subg_radio.c for why
-# FreeRTOS specifically.
-#
-# CAVEAT, weaker than the RAIL check above: there is no real generated
-# FreeRTOS/DMP project on disk yet (bt_rail_dmp_soc_empty_freertos has not
-# been created in Simplicity Studio), so this compiles against the raw SDK
-# package headers directly, not against a project's own generated
-# cmake_gcc/*.cmake include/define list the way the RAIL side is. It only
-# works at all because FreeRTOSConfig.h's own `#include "RTE_Components.h"`
-# happens to resolve against rail_soc_railtest's generated include set
-# (borrowed via "@$RSP" below, alongside the FreeRTOS-specific paths) even
-# though that project is not itself an RTOS project -- a coincidence of what
-# em_device.h/em_assert.h paths it happens to carry, not a guaranteed-stable
-# arrangement. Replace this with real extracted flags from a generated
-# bt_rail_dmp_soc_empty_freertos project once one exists, same as the RAIL
-# side already is.
-FREERTOS_INC="$(dirname "$(find "$HOME/.silabs/slt/installs/conan" -maxdepth 8 -path '*freertos/kernel/include/FreeRTOS.h' 2>/dev/null | head -1)")"
-if [ -z "$FREERTOS_INC" ] || [ ! -d "$FREERTOS_INC" ]; then
-	echo "FreeRTOS headers not found under ~/.silabs/slt/installs/conan" >&2
-	exit 1
-fi
-FREERTOS_ROOT="$(cd "$FREERTOS_INC/../.." && pwd)"
-FREERTOS_FLAGS=(
-	-I"$FREERTOS_INC"
-	-I"$FREERTOS_ROOT/kernel/portable/GCC/ARM_CM33_NTZ/non_secure"
-	-I"$FREERTOS_ROOT/config/series2"
-)
-echo "freertos headers: $FREERTOS_INC"
-
 echo
 echo "=== driver ==="
-"$GCC" "${CFLAGS[@]}" "${FREERTOS_FLAGS[@]}" -I"$REPO/src/drivers/rail" "@$RSP" \
+"$GCC" "${CFLAGS[@]}" -I"$REPO/src/drivers/rail" "@$RSP" \
 	"$REPO/src/drivers/rail/sl_subg_radio.c"
 echo "OK: sl_subg_radio.c"
 
@@ -128,12 +108,10 @@ for f in 4b6b manchester; do
 	echo "OK: $f.c"
 done
 
-echo "=== protocol layer (aps) -- FreeRTOS task/queue dispatch, see caveat above ==="
+echo "=== protocol layer (aps) -- Micrium OS task/queue dispatch ==="
 APS_INCLUDES=(-I"$REPO/src" -I"$REPO/src/aps" -I"$REPO/src/drivers/rail" -I"$REPO/src/encoding")
 for f in aps aps_transport; do
-	"$GCC" -fsyntax-only -mcpu=cortex-m33 -mthumb -mfpu=fpv5-sp-d16 -mfloat-abi=hard -mcmse \
-		-Wall -Wextra -Og --specs=nano.specs \
-		"${FREERTOS_FLAGS[@]}" "${APS_INCLUDES[@]}" "@$RSP" "$REPO/src/aps/$f.c"
+	"$GCC" "${CFLAGS[@]}" "${APS_INCLUDES[@]}" "@$RSP" "$REPO/src/aps/$f.c"
 	echo "OK: $f.c"
 done
 

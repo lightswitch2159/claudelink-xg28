@@ -27,26 +27,27 @@
  *    this file compiles and its command parsing is testable before BLE
  *    exists, matching the driver's own "compile-clean, not hardware-run yet"
  *    status (see README.md).
- * 4. DISPATCH MODEL, RESOLVED THIS SESSION: the source runs a dedicated
- *    Zephyr thread (K_THREAD_STACK_DEFINE/k_thread_create) reading a depth-4
- *    k_msgq, specifically so a blocking CMD_SEND_AND_LISTEN or CMD_GET_PKT
- *    (up to a client-supplied timeout, seconds) does not stall whatever runs
- *    the BLE stack. An earlier version of this port dispatched synchronously
- *    and inline instead, because no RTOS had been chosen yet. FreeRTOS is now
- *    confirmed as the sanctioned RTOS for this board/project shape --
- *    Silicon Labs' own DMP example templates require it (see the RTOS note in
- *    sl_subg_radio.c, which resolved the same open question for that file's
- *    blocking-wait placeholders) -- so this is ported for real below: a
- *    depth-4 static FreeRTOS queue plus a dedicated static task, the direct
- *    structural equivalent of the source's k_msgq/k_thread. aps_put_cmd() now
- *    enqueues (non-blocking, matching K_NO_WAIT) and returns immediately, so
- *    whatever calls it (the BLE GATT write callback, once that layer exists)
- *    is not blocked for the duration of a long listen -- the exact property
- *    the earlier synchronous version gave up and flagged as a regression.
- *    CMD_UPDATE_REG still runs inline rather than through the queue, exactly
- *    as in the source -- it never went through the queue there either, so
- *    this was never actually affected by the synchronous-dispatch interim
- *    state; restoring the real queue does not change how it is handled.
+ * 4. DISPATCH MODEL: the source runs a dedicated Zephyr thread
+ *    (K_THREAD_STACK_DEFINE/k_thread_create) reading a depth-4 k_msgq,
+ *    specifically so a blocking CMD_SEND_AND_LISTEN or CMD_GET_PKT (up to a
+ *    client-supplied timeout, seconds) does not stall whatever runs the BLE
+ *    stack. Ported here as a Micrium OS task + OS_Q of the same depth -- the
+ *    RTOS for this project, corrected from an earlier FreeRTOS assumption
+ *    after generating a real rail_bt_dmp_soc_range_test project for BRD2705A
+ *    and reading its .slcp (device_series_2 -> micriumos_kernel; see the RTOS
+ *    note in sl_subg_radio.c for the full trail). Micrium OS's OSQPost()
+ *    posts a POINTER, not a value copy (unlike FreeRTOS's xQueueSend(), which
+ *    the previous version relied on to copy struct aps_req by value) -- so
+ *    aps_put_cmd() below copies into one of APS_QUEUE_DEPTH static pool slots
+ *    and posts a pointer to that slot, sized to exactly match the queue depth
+ *    so a slot is never reused while still queued. aps_put_cmd() still
+ *    enqueues non-blocking and returns immediately (OSQPost() never blocks
+ *    the poster in Micrium OS, matching the source's K_NO_WAIT and the
+ *    property this whole design exists to preserve: the BLE GATT write
+ *    callback, once that layer exists, is not blocked for the duration of a
+ *    long listen). CMD_UPDATE_REG still runs inline rather than through the
+ *    queue, exactly as in the source -- it never went through the queue
+ *    there either.
  * 5. Byte-order and logging helpers (sys_get_be16/32, sys_put_be16/32, LOG_*)
  *    are Zephyr (zephyr/sys/byteorder.h, zephyr/logging/log.h) and are
  *    replaced with small local equivalents below rather than pulled in from
@@ -67,9 +68,8 @@
 #include "4b6b.h"
 #include "manchester.h"
 
-#include "FreeRTOS.h"
-#include "task.h"
-#include "queue.h"
+#include "os.h"
+#include "rtos_err.h"
 
 /* ------------------------------------------------------------------------- *
  * Byte order and logging -- local replacements for Zephyr's
@@ -698,45 +698,61 @@ static void aps_dispatch(const struct aps_req *req)
 /* Depth 4, as in the source's K_MSGQ_DEFINE(aps_msgq, sizeof(struct aps_req),
  * 4, 4) -- absorbs a three-write frequency burst (CMD_UPDATE_REG, though,
  * never actually enters this queue; see below) without dropping a queued
- * command. Stack size in words (FreeRTOS StackType_t units, not bytes) --
- * not yet tuned against a real measured high-water mark, carried over as a
- * reasonable starting guess from the source's 2048-BYTE Zephyr stack.
+ * command. Stack size in CPU_STK units (Micrium OS's native stack element
+ * type, not bytes) -- not yet tuned against a real measured high-water mark,
+ * carried over as a reasonable starting guess from the source's 2048-BYTE
+ * Zephyr stack.
  */
-#define APS_TASK_STACK_SIZE_WORDS 512
-#define APS_TASK_PRIORITY 2   /* TODO: not yet verified against a real DMP
-				* project's task priority scheme -- must end up
-				* below whatever priority the generated
-				* Bluetooth stack task(s) run at, mirroring the
-				* source's "priority below the Bluetooth RX
-				* thread" requirement (see the source's own
-				* comment on APS_THREAD_PRIORITY). FreeRTOS
-				* priority numbers are not on the same scale as
-				* Zephyr's, so the source's literal value (7)
-				* does not carry over -- this needs checking
-				* once a real bt_rail_dmp_soc_empty_freertos
-				* project exists and its BLE task priorities
-				* can be read from its own generated code,
-				* same discipline as the RAIL_* vs sl_rail_*
-				* question in sl_subg_radio.c.
-				*/
+#define APS_TASK_STACK_SIZE_ELEMS 512
+#define APS_TASK_PRIORITY 10   /* TODO: not yet verified against this
+				 * project's real Bluetooth task priorities --
+				 * must end up below (i.e. numerically GREATER
+				 * than, in Micrium OS's convention where 0 is
+				 * highest priority -- confirmed from os.h:
+				 * OS_PRIO_INIT is defined as OS_CFG_PRIO_MAX,
+				 * the "unassigned" sentinel, implying the
+				 * numeric max is the least urgent end of the
+				 * range) whatever priority the generated
+				 * Bluetooth stack task(s) run at, mirroring the
+				 * source's "priority below the Bluetooth RX
+				 * thread" requirement (APS_THREAD_PRIORITY).
+				 * This project's own task priorities were not
+				 * read this session -- same discipline as the
+				 * RAIL_* vs sl_rail_* question, needs checking
+				 * against real generated/configured values
+				 * before this number means anything.
+				 */
 #define APS_QUEUE_DEPTH 4
 
-static StackType_t s_aps_task_stack[APS_TASK_STACK_SIZE_WORDS];
-static StaticTask_t s_aps_task_buf;
-static TaskHandle_t s_aps_task_handle;
+static CPU_STK s_aps_task_stack[APS_TASK_STACK_SIZE_ELEMS];
+static OS_TCB s_aps_task_tcb;
+static OS_Q s_aps_queue;
 
-static uint8_t s_aps_queue_storage[APS_QUEUE_DEPTH * sizeof(struct aps_req)];
-static StaticQueue_t s_aps_queue_buf;
-static QueueHandle_t s_aps_queue;
+/* OSQPost() posts a POINTER, not a value copy (unlike FreeRTOS's
+ * xQueueSend(), which the previous version of this file relied on) -- see
+ * item 4 in the file banner. Sized to exactly APS_QUEUE_DEPTH so a pool slot
+ * is never in use by more than one queued command at a time: the queue
+ * itself (max_qty APS_QUEUE_DEPTH) guarantees no more than APS_QUEUE_DEPTH
+ * posts are outstanding before a post is refused, which is exactly the pool
+ * size.
+ */
+static struct aps_req s_aps_req_pool[APS_QUEUE_DEPTH];
+static uint8_t s_aps_req_pool_next;
 
 static void aps_task_fn(void *p_arg)
 {
-	struct aps_req req;
+	RTOS_ERR err;
 
 	(void)p_arg;
 
 	while (true) {
-		if (xQueueReceive(s_aps_queue, &req, portMAX_DELAY) != pdTRUE) {
+		OS_MSG_SIZE msg_size;
+		struct aps_req *req;
+
+		err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+		req = (struct aps_req *)OSQPend(&s_aps_queue, 0, OS_OPT_PEND_BLOCKING,
+						&msg_size, NULL, &err);
+		if (RTOS_ERR_CODE_GET(err) != RTOS_ERR_NONE || req == NULL) {
 			continue;
 		}
 		/* Source's Subg_ClrIntFlg(): clear any stale preemption request
@@ -748,7 +764,7 @@ static void aps_task_fn(void *p_arg)
 		 */
 		sl_subg_clear_abort();
 		loop_count++;
-		aps_dispatch(&req);
+		aps_dispatch(req);
 	}
 }
 
@@ -758,7 +774,6 @@ static void aps_task_fn(void *p_arg)
 
 void aps_put_cmd(const uint8_t *buf, uint16_t len, int8_t rssi)
 {
-	struct aps_req req;
 	uint16_t param_len;
 
 	if (buf == NULL || len == 0) {
@@ -802,18 +817,29 @@ void aps_put_cmd(const uint8_t *buf, uint16_t len, int8_t rssi)
 		return;
 	}
 
-	req.cmd = buf[1];
-	req.rssi = rssi;
-	req.len = param_len;
-	memcpy(req.param, &buf[2], param_len);
+	{
+		struct aps_req *slot = &s_aps_req_pool[s_aps_req_pool_next];
+		RTOS_ERR err;
 
-	/* Non-blocking send, matching the source's k_msgq_put(..., K_NO_WAIT):
-	 * a full queue drops the command rather than blocking the caller (the
-	 * BLE GATT write callback, once that layer exists) -- losing a command
-	 * to a full queue is preferable to stalling the link.
-	 */
-	if (xQueueSend(s_aps_queue, &req, 0) != pdTRUE) {
-		APS_LOG_DBG("busy, command 0x%02x dropped", req.cmd);
+		s_aps_req_pool_next = (uint8_t)((s_aps_req_pool_next + 1) % APS_QUEUE_DEPTH);
+
+		slot->cmd = buf[1];
+		slot->rssi = rssi;
+		slot->len = param_len;
+		memcpy(slot->param, &buf[2], param_len);
+
+		/* Non-blocking, matching the source's k_msgq_put(..., K_NO_WAIT):
+		 * OSQPost() never blocks the poster in Micrium OS (unlike
+		 * OSQPend()) -- a full queue simply returns an error rather than
+		 * blocking the caller (the BLE GATT write callback, once that
+		 * layer exists). Losing a command to a full queue is preferable
+		 * to stalling the link.
+		 */
+		err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+		OSQPost(&s_aps_queue, slot, sizeof(*slot), OS_OPT_POST_FIFO, &err);
+		if (RTOS_ERR_CODE_GET(err) != RTOS_ERR_NONE) {
+			APS_LOG_DBG("busy, command 0x%02x dropped", slot->cmd);
+		}
 	}
 }
 
@@ -831,13 +857,16 @@ void aps_set_active(bool on)
 
 void aps_init(void)
 {
-	s_aps_queue = xQueueCreateStatic(APS_QUEUE_DEPTH, sizeof(struct aps_req),
-					 s_aps_queue_storage, &s_aps_queue_buf);
+	RTOS_ERR err;
 
-	s_aps_task_handle = xTaskCreateStatic(aps_task_fn, "aps",
-					      APS_TASK_STACK_SIZE_WORDS, NULL,
-					      APS_TASK_PRIORITY, s_aps_task_stack,
-					      &s_aps_task_buf);
+	err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+	OSQCreate(&s_aps_queue, "aps cmd queue", APS_QUEUE_DEPTH, &err);
+
+	err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+	OSTaskCreate(&s_aps_task_tcb, "aps", aps_task_fn, NULL, APS_TASK_PRIORITY,
+		    s_aps_task_stack, APS_TASK_STACK_SIZE_ELEMS / 10,
+		    APS_TASK_STACK_SIZE_ELEMS, 0, 0, NULL,
+		    OS_OPT_TASK_STK_CHK | OS_OPT_TASK_STK_CLR, &err);
 
 	/* sl_subg_radio_init() is the caller's responsibility, same as the source
 	 * (subg_init() is called separately from wherever board init happens),

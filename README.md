@@ -6,10 +6,14 @@ real `-fsyntax-only` compile against the exact toolchain, include paths, and
 preprocessor defines Simplicity Studio's own generated project uses for this
 board (`tools/check_compile.sh`, reproducible, extracts its flags directly
 from the live generated project rather than hand-maintaining a copy). Zero
-errors, zero warnings with `-Wall -Wextra`. That is a real, if partial,
-verification -- every header include resolves, every `RAIL_*()` call site
-matches its actual declared signature, every constant used is real -- not
-just a plausible-looking skeleton.
+errors, zero warnings with `-Wall -Wextra`. As of this check, that project is
+`rail_bt_dmp_soc_range_test` -- a real, generated **Bluetooth + RAIL DMP**
+project for BRD2705A, not the bare RAIL-only `rail_soc_railtest` project used
+earlier -- so this now verifies the actual `sl_rail_*()` API family and
+Micrium OS integration this port needs, not just RAIL in isolation. Every
+header include resolves, every call site matches its actual declared
+signature, every constant used is real -- not just a plausible-looking
+skeleton.
 
 ## What this is
 
@@ -55,109 +59,105 @@ project, built and eventually generated through Simplicity Studio 6.
   (`feather-nrf52832` branch) -- they had zero Zephyr dependency there and
   need no changes here.
 
-- **A radio driver skeleton exists**, `src/drivers/rail/sl_subg_radio.{c,h}`,
-  written against real `RAIL_*()` signatures verified two different ways: by
-  reading the real header on disk (`hal_silabs`, fetched into
-  `orangelink-ncs-ws` this session) and by reading Simplicity Studio's own
-  generated project on disk at
-  `~/SimplicityStudio/v6_workspace/rail_soc_railtest/`. **Verified to compile
-  clean** against that project's exact real toolchain/include/define set
-  (`tools/check_compile.sh`) -- not run on hardware, but a real, non-trivial
-  check, not just a plausible-looking skeleton. Two real, substantive
-  corrections happened while writing it, both worth keeping on record rather
-  than quietly fixing:
+- **A radio driver exists**, `src/drivers/rail/sl_subg_radio.{c,h}`, written
+  against real `sl_rail_*()` signatures and real Micrium OS primitives, both
+  checked against the actual generated `rail_bt_dmp_soc_range_test` project
+  on disk (`SimplicityStudio/v6_workspace/rail_bt_dmp_soc_range_test/`) --
+  the real Bluetooth+RAIL DMP project this driver is meant to integrate with,
+  not the bare RAIL-only `rail_soc_railtest` used for earlier iterations.
+  **Verified to compile clean** against that project's real
+  toolchain/include/define set (`tools/check_compile.sh`).
 
-  1. **API family, corrected once already.** `RAIL_Init`/`RAIL_StartTx`/
-     `RAIL_StartRx`/`RAIL_ConfigChannels` (PascalCase) are marked
-     `@deprecated` in this SDK's header comments, in favour of a newer
-     lowercase `sl_rail_*()` family. The driver was first written against
-     `sl_rail_*` on that basis. That was wrong: Simplicity Studio's own
-     Radio Configurator generates `RAIL_ChannelConfig_t` (the *old* type,
-     named `MDT_OOK_channelConfig`, in `autogen/rail_config.c`) for this
-     exact project, and its own generated init glue
-     (`autogen/sl_rail_util_init.c`) calls `RAIL_Init`/`RAIL_ConfigData`/
-     `RAIL_ConfigChannels` throughout -- not one `sl_rail_*` call anywhere in
-     it. The deprecation tags are real, but this project template is built on
-     the "deprecated" API regardless, and the two families are not
-     interchangeable -- passing the generated `RAIL_ChannelConfig_t` to
-     `sl_rail_config_channels()` (which takes `sl_rail_channel_config_t`)
-     would be a straight type mismatch. Caught by reading the real generated
-     file rather than trusting the header comments in isolation, but only
-     after the first version was already written and briefly committed.
+  Getting here took two real, distinct corrections on top of two more from
+  the previous iteration -- all four are worth keeping on record rather than
+  quietly overwriting, because each was caused by a different, genuine
+  ambiguity in the SDK rather than carelessness:
 
-  2. **Bring-up should call the generated `sl_rail_util_init()`**
-     (`autogen/sl_rail_util_init.h`), not reimplement
-     `RAIL_Init`+`RAIL_ConfigChannels` by hand -- it is Silicon Labs' own
-     tested glue, already wired to the real `channelConfigs[]`/
-     `MDT_OOK_channelConfig`, including calibration and PA setup this driver
-     has no reason to reimplement. `sl_rail_util_get_handle(SL_RAIL_UTIL_HANDLE_INST0)`
-     retrieves the resulting handle afterward.
+  1. **API family, corrected a second time: `sl_rail_*`, not `RAIL_*`.**
+     Two pieces of real generated evidence exist in this repo's history and
+     point different directions -- not a contradiction, but a discriminator
+     by SDK component. `rail_soc_railtest` pulls in component id
+     `rail_util_init` and its generated `autogen/sl_rail_util_init.c` calls
+     `RAIL_Init`/`RAIL_ConfigChannels` throughout (confirmed by reading that
+     file -- this drove the *first* correction, from an initial wrong guess
+     of `sl_rail_*`, and was genuinely correct for that project). But
+     `rail_bt_dmp_soc_range_test` -- the project this driver actually needs
+     to integrate with -- pulls in a *differently-named* component,
+     `sl_rail_util_init`, whose generated `autogen/sl_rail_util_callbacks.c`
+     defines a real (not example/commented-out) `sl_rail_util_on_event
+     (sl_rail_handle_t, sl_rail_events_t)` as the weak stub this driver's
+     callback overrides, and whose `autogen/sl_rail_util_init.h` declares
+     `sl_rail_util_get_handle()` returning `sl_rail_handle_t`. Every
+     `sl_rail_*()` signature the driver calls (`set_tx_fifo`/`set_rx_fifo`/
+     `write_tx_fifo`/`read_rx_fifo`/`start_tx`/`start_rx`/`idle`/`get_rssi`/
+     `set_tx_power_dbm`/`config_events`) was checked against the real
+     `sl_rail.h` in that project's own copied SDK, not extrapolated from the
+     `RAIL_*` names -- some differ by more than casing (e.g.
+     `sl_rail_get_rssi()` takes a microsecond wait-timeout, not the
+     `RAIL_GetRssi()` bool it replaces; the FIFO setters take a
+     `sl_rail_fifo_buffer_align_t*`, a `uint32_t` alias requiring
+     word-array-typed buffers, not a bare `uint8_t*`).
 
-  Resolved since the last commit:
+  2. **RTOS, corrected a second time: Micrium OS, not FreeRTOS.** The
+     previous iteration concluded FreeRTOS from the `bt_rail_dmp_soc_empty`
+     example, which ships independent FreeRTOS and Micrium OS project
+     variants. That doesn't generalize: `rail_bt_dmp_soc_range_test`'s own
+     manifest selects the RTOS by silicon series --
+     `micriumos_kernel, condition: [device_series_2]` /
+     `freertos, condition: [device_series_3]` -- and the EFR32xG28 is Series
+     2, so this project (the one actually generated for BRD2705A) only ever
+     gets Micrium OS. The former busy-spin placeholders (RX-data-or-timeout,
+     TX-done) are now real Micrium OS event flags (`OSFlagPend`/`OSFlagPost`),
+     grounded against the real `os.h` in this project's own copied SDK.
+     `OSFlagPost()` is callable from both ISR and task context in Micrium OS
+     III (unlike FreeRTOS's separate `*FromISR()` family), confirmed from
+     `os.h`'s own `SL_CODE_CLASSIFY` annotations -- so, unlike the FreeRTOS
+     version, no ISR/task-context API split was needed. `timeout == 0` means
+     "wait forever" for `OSFlagPend()` (confirmed from the real Doxygen
+     comment in `os_flag.c`), which conveniently matches
+     `sl_subg_get_pkt()`'s own contract with no sentinel translation needed.
+     Millisecond-to-tick conversion calls the real `OSTimeTickRateHzGet()` at
+     runtime rather than assuming a compile-time tick rate, since
+     `OS_CFG_TICK_RATE_HZ` was not found defined anywhere in this project's
+     own config/autogen/cmake output (unlike FreeRTOS's
+     `configTICK_RATE_HZ`, a plain header define) -- guessing 1000 Hz here
+     would have been exactly the kind of unverified assumption this project
+     has already had to correct twice.
 
-  - **The event callback wiring question is settled.** Read
-    `autogen/sl_rail_util_callbacks.c` directly: `sl_rail_util_on_event()`
-    is declared `__WEAK` there with an empty default body, and that file's
-    own header warns "any application code placed within this file will be
-    discarged upon project regeneration" -- the intended pattern is a
-    weak-symbol override living outside `autogen/`, not editing the
-    generated file or manually chaining callbacks. The driver's handler is
-    now literally named `sl_rail_util_on_event()` with external linkage, so
-    the linker uses it in place of the weak stub. No registration call
-    needed. `RAIL_ConfigEvents()` in `sl_subg_radio_init()` is still
-    required separately -- it controls which event bits are unmasked, not
-    which function receives them, and those are genuinely two different
-    questions.
+  Both corrections were only possible because a real
+  `rail_bt_dmp_soc_range_test` project now exists on disk for BRD2705A --
+  see "What is not started" in the previous revision of this README for why
+  that was the blocking next step, and the Provenance section below for how
+  it was chosen (it was NOT the first DMP example tried; `Connect Bluetooth
+  DMP - SoC Empty` was created first and is a different Silicon Labs stack,
+  Connect, layered over RAIL -- wrong for a project that needs unmediated
+  RAIL access for its own hand-built packet framing).
+
+  Carried over, unchanged in substance from earlier verification:
+
+  - The event callback wiring pattern (weak-symbol override of
+    `sl_rail_util_on_event()`, confirmed again in this project's own
+    generated `autogen/sl_rail_util_callbacks.c`).
+  - A real latent bug fixed during the Micrium OS rewrite: a full 107-byte
+    receive with no `0x00` terminator never set the "have data" flag, since
+    only the terminator path did.
 
   Real, still-open gaps, marked rather than papered over:
 
-  - `RAIL_SetRxFifo()`'s exact parameter order was checked this time
-    (`RAIL_Handle_t, uint8_t *addr, uint16_t *size`) -- confirmed, not
-    assumed.
-  - **RTOS question resolved: FreeRTOS.** Silicon Labs ships exactly two DMP
-    (Bluetooth + proprietary RAIL) project templates that actually coexist
-    BLE with a RAIL protocol -- `bt_rail_dmp_soc_empty` and
-    `bt_rail_dmp_soc_light` -- and *both* require an RTOS: each ships a
-    FreeRTOS variant and a Micrium OS variant, with no bare-metal DMP option
-    at all. Confirmed by reading the real `.slcp` manifests and example
-    source under
-    `~/.silabs/slt/installs/conan/p/simpleca33d691c539/p/bluetooth_le_app/example/bt_rail_dmp_soc_empty/`,
-    not inferred from documentation. FreeRTOS chosen over Micrium OS as the
-    more portable/open option. The two former busy-spin placeholders
-    (RX-data-or-timeout, TX-done) are now a real FreeRTOS event group,
-    grounded against the real `event_groups.h`/`task.h` on disk (bits set
-    from `sl_rail_util_on_event()` via the ISR-safe `...FromISR()` API --
-    the DMP example's own `readme.md` states that callback runs from
-    interrupt context, so this is not a guess). While in there, fixed a real
-    latent bug the busy-spin version had: a full 107-byte receive with no
-    `0x00` terminator never set the "have data" flag, since only the
-    terminator path did.
-  - **CAUTION, the API family question may not be settled after all.** That
-    same DMP example's `freertos/app_proprietary.c` defines a *live*
-    (non-commented, must compile) `sl_rail_util_on_event(sl_rail_handle_t,
-    sl_rail_events_t)` -- the lowercase family, contradicting this driver's
-    `RAIL_*` choice above. Traced to a real, specific cause rather than left
-    as a contradiction: `rail_soc_railtest.slcp` pulls in SDK component id
-    `rail_util_init` (legacy, confirmed generating `RAIL_*` glue from its own
-    autogen output), while `bt_rail_dmp_soc_empty_freertos.slcp` pulls in a
-    *differently-named* component, `sl_rail_util_init` -- two distinct SDK
-    components, not one component behaving two ways. This driver's `RAIL_*`
-    calls are still correct for the currently-generated `rail_soc_railtest`
-    project they're checked against, but will likely need rewriting to
-    `sl_rail_*` once a real `bt_rail_dmp_soc_empty_freertos` project is
-    generated for BRD2705A and its own `autogen/` output can be read -- same
-    discipline as the original correction, not resolved by this note alone.
-  - TX power control now calls a real API, `RAIL_SetTxPowerDbm()` (confirmed
-    from the real `rail.h` this session -- deci-dBm units, not the RFM69
-    driver's raw PA register value). Not hardware-verified, and depends on
-    `RAIL_ConfigTxPower()` having already run during `sl_rail_util_init()`,
-    which is expected but not independently confirmed for this exact project.
-  - Frequency control (`sl_subg_set_freq`/`sl_subg_get_freq`) was added for
-    the protocol layer below to call. RAIL has no arbitrary-Hz tune, only
-    channel selection, so these map a requested Hz onto the nearest channel of
-    the static channel config (`SL_SUBG_BASE_FREQ_HZ` + n \*
-    `SL_SUBG_CHANNEL_SPACING_HZ`, channels 0-20) rather than reconfiguring the
-    PHY.
+  - Frequency control (`sl_subg_set_freq`/`sl_subg_get_freq`) maps a
+    requested Hz onto the nearest channel of the static channel config
+    (`SL_SUBG_BASE_FREQ_HZ` + n * `SL_SUBG_CHANNEL_SPACING_HZ`, channels
+    0-20) rather than reconfiguring the PHY -- RAIL has no arbitrary-Hz tune,
+    only channel selection.
+  - TX power control calls `sl_rail_set_tx_power_dbm()` (deci-dBm units, not
+    the RFM69 driver's raw PA register value). Not hardware-verified, and
+    depends on TX power having already been configured during
+    `sl_rail_util_init()` -- not independently confirmed for this exact
+    project's autogen output.
+  - The radio PHY settings table above (OOK, 16.384 kbps, etc.) was
+    configured in `rail_soc_railtest`'s Radio Configurator, not yet
+    re-applied to `rail_bt_dmp_soc_range_test` -- that's the next concrete
+    step, see "What is not started".
 
 - **The APS protocol layer is ported.** `src/aps/aps.{c,h}` -- the RileyLink
   command handler (`subg_rfspy 2.2`: `CMD_GET_STATE`, `CMD_SEND_PKT`,
@@ -174,58 +174,75 @@ project, built and eventually generated through Simplicity Studio 6.
     `sl_rail_util_on_event()`, one layer up, so this compiles and its command
     parsing is testable before a BLE layer exists.
   - Zephyr's thread+message-queue dispatch, byte-order helpers, and logging
-    macros are gone (this is not a Zephyr build). **Dispatch now runs on a
-    real FreeRTOS task and static queue** -- the direct structural
-    equivalent of the source's `k_thread`/`k_msgq` (depth 4, matching), now
-    that FreeRTOS is confirmed as the sanctioned RTOS (see the driver's RTOS
-    note above). An earlier version of this port dispatched synchronously and
-    inline instead, while the RTOS question was still open; that version is
-    gone. `aps_put_cmd()` now enqueues (non-blocking, matching the source's
-    `K_NO_WAIT`) and returns immediately, so whatever calls it -- the BLE GATT
-    write callback, once that layer exists -- is not blocked for the
-    duration of a long listen, restoring the exact property the interim
-    synchronous version gave up. The dispatch task's priority
-    (`APS_TASK_PRIORITY`) is a placeholder, not yet checked against a real
-    DMP project's Bluetooth task priorities the way the source's own comment
-    says it must sit below.
+    macros are gone (this is not a Zephyr build). **Dispatch runs on a real
+    Micrium OS task and `OS_Q`** -- the direct structural equivalent of the
+    source's `k_thread`/`k_msgq` (depth 4, matching), corrected from an
+    earlier FreeRTOS version once `rail_bt_dmp_soc_range_test` confirmed
+    Micrium OS is what this project actually uses (see the driver's RTOS
+    note). One real structural difference from the FreeRTOS version:
+    Micrium OS's `OSQPost()` posts a *pointer*, not a value copy the way
+    FreeRTOS's `xQueueSend()` did -- so `aps_put_cmd()` copies into one of
+    `APS_QUEUE_DEPTH` static pool slots (sized to exactly match the queue
+    depth, so a slot is never reused while still queued) and posts a pointer
+    to that slot. `aps_put_cmd()` still enqueues non-blocking and returns
+    immediately -- `OSQPost()` never blocks the poster in Micrium OS, so this
+    needed no extra work to preserve the source's `K_NO_WAIT` property (the
+    BLE GATT write callback, once that layer exists, is not blocked for the
+    duration of a long listen). The dispatch task's priority
+    (`APS_TASK_PRIORITY`) is still a placeholder, not yet checked against
+    this project's real Bluetooth task priorities the way the source's own
+    comment says it must sit below (in Micrium OS's convention, numerically
+    *above* -- confirmed from `os.h`: `OS_PRIO_INIT` is defined as
+    `OS_CFG_PRIO_MAX`, the "unassigned" sentinel, implying the numeric max is
+    the least-urgent end of the range).
 
   Verified to compile clean, zero warnings, alongside the driver
-  (`tools/check_compile.sh` now covers `src/aps/*.c` too, including the
-  FreeRTOS headers both files now depend on -- see the script's own comment
-  for the weaker-verification-tier caveat: there is no real generated
-  FreeRTOS/DMP project on disk yet, so this checks against the raw SDK
-  headers rather than a project's own generated build flags).
+  (`tools/check_compile.sh` now covers `src/aps/*.c` too) against
+  `rail_bt_dmp_soc_range_test`'s real generated build flags -- no more
+  weaker-verification-tier caveat: that project genuinely exists on disk now
+  and includes Micrium OS in its own `cmake_gcc/*.cmake` output, so the
+  earlier script's separate FreeRTOS-header-hunting section is gone entirely.
 
 ## What is not started
 
 - BLE side entirely -- no work yet on Silicon Labs' native Bluetooth stack
   or the Dynamic Multiprotocol coexistence structure. `aps_transport_send()`
   has no real implementation to hand responses to yet.
-- **Generating a real `bt_rail_dmp_soc_empty_freertos` project for BRD2705A
-  in Simplicity Studio** is the next concrete step -- it would settle the
-  RAIL_*/sl_rail_* question for real (see above), give real Bluetooth task
-  priorities to tune `APS_TASK_PRIORITY` against, and give a real
-  `cmake_gcc/*.cmake` to extract `tools/check_compile.sh`'s FreeRTOS flags
-  from instead of the current borrowed/coincidental set. Needs Simplicity
-  Studio's GUI, same as the RAIL PHY configuration was done.
+- **Re-apply the RAIL PHY settings** (the OOK/16.384kbps/etc. table above,
+  currently only configured in `rail_soc_railtest`'s Radio Configurator) to
+  `rail_bt_dmp_soc_range_test`'s own Radio Configurator -- needed before this
+  project's radio actually matches the pump's PHY. Needs Simplicity Studio's
+  GUI, same as the original configuration was done.
+- **`APS_TASK_PRIORITY` needs tuning** against this project's real Bluetooth
+  task priorities (see above) -- not yet read from the generated project.
 - Nothing has run on real hardware. The board has not arrived yet.
 
 ## Provenance
 
-Every RAIL fact in this README and in the driver skeleton's comments was
-checked against one of two real sources, not recalled from memory:
+Every RAIL/RTOS fact in this README and in the driver/protocol-layer
+comments was checked against a real source on disk, not recalled from
+memory:
 
 - header/source files fetched into `orangelink-ncs-ws/modules/hal/silabs`
   this session (pinned to Zephyr's own `hal_silabs` revision,
   `f5201210afa1319ed8dd8dbe21682bcb63b25771`), or
-- Simplicity Studio's own generated project, live on this machine at
-  `~/SimplicityStudio/v6_workspace/rail_soc_railtest/`, built against SDK
-  Suite 2026.6.1.
+- Simplicity Studio's own generated projects, live on this machine:
+  `~/SimplicityStudio/v6_workspace/rail_soc_railtest/` (bare RAIL, no
+  Bluetooth/RTOS -- the original driver-skeleton/encoding-layer reference)
+  and `~/SimplicityStudio/v6_workspace/rail_bt_dmp_soc_range_test/` (real
+  Bluetooth+RAIL DMP, Micrium OS -- generated this session, now the primary
+  reference for the driver and protocol layer), both built against SDK Suite
+  2026.6.1.
 
-The second source is what actually caught the RAIL_*/sl_rail_* mistake --
-the header comments alone (from the first source) said the wrong thing
-("use sl_rail_*, RAIL_* is deprecated") in a way that sounded authoritative
-but did not match what Silicon Labs' own generator and generated init glue
-actually do. Prefer checking the live generated project over the vendored
-headers alone when the two could plausibly disagree. Where neither source
-resolved something, it is marked TODO rather than asserted.
+The second kind of source is what caught every correction on record here:
+the `RAIL_*`/`sl_rail_*` mistake (header comments alone said the wrong thing,
+"use sl_rail_*, RAIL_* is deprecated," in a way that sounded authoritative
+but didn't match what the generator actually produced for either project),
+and the FreeRTOS/Micrium OS mistake (a plausible generalization from one DMP
+example that didn't hold for the one actually generated for this board).
+Prefer checking the live generated project over documentation, header
+comments, or even a *different* real generated project, when they could
+plausibly disagree -- "real" and "generated" are each necessary but not
+sufficient on their own; it has to be the real generated output of the
+specific project this code integrates with. Where no source resolved
+something, it is marked TODO rather than asserted.
