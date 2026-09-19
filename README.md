@@ -114,12 +114,39 @@ project, built and eventually generated through Simplicity Studio 6.
   - `RAIL_SetRxFifo()`'s exact parameter order was checked this time
     (`RAIL_Handle_t, uint8_t *addr, uint16_t *size`) -- confirmed, not
     assumed.
-  - Blocking waits (`wait_for_rx_data_or_timeout()`, the TX-done wait) are
-    written as placeholder busy-spins, explicitly marked as such. They need
-    whatever real synchronization primitive the eventual RTOS/bare-metal
-    environment provides -- not yet known, since it depends on which project
-    template (bare RAILtest vs. an RTOS-based Bluetooth+DMP example) this
-    becomes.
+  - **RTOS question resolved: FreeRTOS.** Silicon Labs ships exactly two DMP
+    (Bluetooth + proprietary RAIL) project templates that actually coexist
+    BLE with a RAIL protocol -- `bt_rail_dmp_soc_empty` and
+    `bt_rail_dmp_soc_light` -- and *both* require an RTOS: each ships a
+    FreeRTOS variant and a Micrium OS variant, with no bare-metal DMP option
+    at all. Confirmed by reading the real `.slcp` manifests and example
+    source under
+    `~/.silabs/slt/installs/conan/p/simpleca33d691c539/p/bluetooth_le_app/example/bt_rail_dmp_soc_empty/`,
+    not inferred from documentation. FreeRTOS chosen over Micrium OS as the
+    more portable/open option. The two former busy-spin placeholders
+    (RX-data-or-timeout, TX-done) are now a real FreeRTOS event group,
+    grounded against the real `event_groups.h`/`task.h` on disk (bits set
+    from `sl_rail_util_on_event()` via the ISR-safe `...FromISR()` API --
+    the DMP example's own `readme.md` states that callback runs from
+    interrupt context, so this is not a guess). While in there, fixed a real
+    latent bug the busy-spin version had: a full 107-byte receive with no
+    `0x00` terminator never set the "have data" flag, since only the
+    terminator path did.
+  - **CAUTION, the API family question may not be settled after all.** That
+    same DMP example's `freertos/app_proprietary.c` defines a *live*
+    (non-commented, must compile) `sl_rail_util_on_event(sl_rail_handle_t,
+    sl_rail_events_t)` -- the lowercase family, contradicting this driver's
+    `RAIL_*` choice above. Traced to a real, specific cause rather than left
+    as a contradiction: `rail_soc_railtest.slcp` pulls in SDK component id
+    `rail_util_init` (legacy, confirmed generating `RAIL_*` glue from its own
+    autogen output), while `bt_rail_dmp_soc_empty_freertos.slcp` pulls in a
+    *differently-named* component, `sl_rail_util_init` -- two distinct SDK
+    components, not one component behaving two ways. This driver's `RAIL_*`
+    calls are still correct for the currently-generated `rail_soc_railtest`
+    project they're checked against, but will likely need rewriting to
+    `sl_rail_*` once a real `bt_rail_dmp_soc_empty_freertos` project is
+    generated for BRD2705A and its own `autogen/` output can be read -- same
+    discipline as the original correction, not resolved by this note alone.
   - TX power control now calls a real API, `RAIL_SetTxPowerDbm()` (confirmed
     from the real `rail.h` this session -- deci-dBm units, not the RFM69
     driver's raw PA register value). Not hardware-verified, and depends on
@@ -147,27 +174,40 @@ project, built and eventually generated through Simplicity Studio 6.
     `sl_rail_util_on_event()`, one layer up, so this compiles and its command
     parsing is testable before a BLE layer exists.
   - Zephyr's thread+message-queue dispatch, byte-order helpers, and logging
-    macros are gone (this is not a Zephyr build). `aps_put_cmd()` now
-    dispatches **synchronously and inline** rather than handing off to a
-    dedicated thread. This is a real, deliberate regression from the source,
-    not a cosmetic substitution: the source's thread exists specifically so a
-    multi-second `CMD_SEND_AND_LISTEN` doesn't stall whatever else needs to
-    run (there, the BLE stack) -- without it, nothing else can run during a
-    long listen. It is written this way because the RTOS/bare-metal question
-    is still open (same open question as the driver's blocking-wait
-    placeholders below), so there is no queue/thread primitive to port to
-    yet. Revisit once that's settled.
+    macros are gone (this is not a Zephyr build). **Dispatch now runs on a
+    real FreeRTOS task and static queue** -- the direct structural
+    equivalent of the source's `k_thread`/`k_msgq` (depth 4, matching), now
+    that FreeRTOS is confirmed as the sanctioned RTOS (see the driver's RTOS
+    note above). An earlier version of this port dispatched synchronously and
+    inline instead, while the RTOS question was still open; that version is
+    gone. `aps_put_cmd()` now enqueues (non-blocking, matching the source's
+    `K_NO_WAIT`) and returns immediately, so whatever calls it -- the BLE GATT
+    write callback, once that layer exists -- is not blocked for the
+    duration of a long listen, restoring the exact property the interim
+    synchronous version gave up. The dispatch task's priority
+    (`APS_TASK_PRIORITY`) is a placeholder, not yet checked against a real
+    DMP project's Bluetooth task priorities the way the source's own comment
+    says it must sit below.
 
   Verified to compile clean, zero warnings, alongside the driver
-  (`tools/check_compile.sh` now covers `src/aps/*.c` too).
+  (`tools/check_compile.sh` now covers `src/aps/*.c` too, including the
+  FreeRTOS headers both files now depend on -- see the script's own comment
+  for the weaker-verification-tier caveat: there is no real generated
+  FreeRTOS/DMP project on disk yet, so this checks against the raw SDK
+  headers rather than a project's own generated build flags).
 
 ## What is not started
 
 - BLE side entirely -- no work yet on Silicon Labs' native Bluetooth stack
   or the Dynamic Multiprotocol coexistence structure. `aps_transport_send()`
   has no real implementation to hand responses to yet.
-- The synchronous-dispatch deviation in `aps.c` (above) needs revisiting once
-  an RTOS/bare-metal decision is made.
+- **Generating a real `bt_rail_dmp_soc_empty_freertos` project for BRD2705A
+  in Simplicity Studio** is the next concrete step -- it would settle the
+  RAIL_*/sl_rail_* question for real (see above), give real Bluetooth task
+  priorities to tune `APS_TASK_PRIORITY` against, and give a real
+  `cmake_gcc/*.cmake` to extract `tools/check_compile.sh`'s FreeRTOS flags
+  from instead of the current borrowed/coincidental set. Needs Simplicity
+  Studio's GUI, same as the RAIL PHY configuration was done.
 - Nothing has run on real hardware. The board has not arrived yet.
 
 ## Provenance

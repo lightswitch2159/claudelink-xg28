@@ -27,24 +27,26 @@
  *    this file compiles and its command parsing is testable before BLE
  *    exists, matching the driver's own "compile-clean, not hardware-run yet"
  *    status (see README.md).
- * 4. DISPATCH MODEL, the one real behavioural deviation: the source runs a
- *    dedicated Zephyr thread (K_THREAD_STACK_DEFINE/k_thread_create) reading a
- *    depth-4 k_msgq, specifically so a blocking CMD_SEND_AND_LISTEN or
- *    CMD_GET_PKT (up to a client-supplied timeout, seconds) does not stall
- *    whatever runs the BLE stack. This project has not yet chosen an RTOS
- *    (see the TODOs in sl_subg_radio.c's wait_for_rx_data_or_timeout() and TX
- *    completion spin-wait -- both already placeholders for the same open
- *    question). Until that is settled there is no queue/thread primitive to
- *    port to, so aps_put_cmd() below dispatches SYNCHRONOUSLY and inline.
- *    This reproduces the single-outstanding-command behaviour (a command
- *    that arrives while another is running is simply not possible, since the
- *    caller is blocked inside the previous one) but drops the "let a queued
- *    register write land between FIFO polls of a live listen" concurrency the
- *    source relies on -- there is no concurrency at all yet. Revisit once the
- *    RTOS/bare-metal question is settled; until then CMD_UPDATE_REG arriving
- *    during a long CMD_SEND_AND_LISTEN cannot be serviced until that call
- *    returns, which is a real regression from the source and is called out
- *    here rather than silently accepted.
+ * 4. DISPATCH MODEL, RESOLVED THIS SESSION: the source runs a dedicated
+ *    Zephyr thread (K_THREAD_STACK_DEFINE/k_thread_create) reading a depth-4
+ *    k_msgq, specifically so a blocking CMD_SEND_AND_LISTEN or CMD_GET_PKT
+ *    (up to a client-supplied timeout, seconds) does not stall whatever runs
+ *    the BLE stack. An earlier version of this port dispatched synchronously
+ *    and inline instead, because no RTOS had been chosen yet. FreeRTOS is now
+ *    confirmed as the sanctioned RTOS for this board/project shape --
+ *    Silicon Labs' own DMP example templates require it (see the RTOS note in
+ *    sl_subg_radio.c, which resolved the same open question for that file's
+ *    blocking-wait placeholders) -- so this is ported for real below: a
+ *    depth-4 static FreeRTOS queue plus a dedicated static task, the direct
+ *    structural equivalent of the source's k_msgq/k_thread. aps_put_cmd() now
+ *    enqueues (non-blocking, matching K_NO_WAIT) and returns immediately, so
+ *    whatever calls it (the BLE GATT write callback, once that layer exists)
+ *    is not blocked for the duration of a long listen -- the exact property
+ *    the earlier synchronous version gave up and flagged as a regression.
+ *    CMD_UPDATE_REG still runs inline rather than through the queue, exactly
+ *    as in the source -- it never went through the queue there either, so
+ *    this was never actually affected by the synchronous-dispatch interim
+ *    state; restoring the real queue does not change how it is handled.
  * 5. Byte-order and logging helpers (sys_get_be16/32, sys_put_be16/32, LOG_*)
  *    are Zephyr (zephyr/sys/byteorder.h, zephyr/logging/log.h) and are
  *    replaced with small local equivalents below rather than pulled in from
@@ -64,6 +66,10 @@
 #include "drivers/rail/sl_subg_radio.h"
 #include "4b6b.h"
 #include "manchester.h"
+
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
 
 /* ------------------------------------------------------------------------- *
  * Byte order and logging -- local replacements for Zephyr's
@@ -686,6 +692,67 @@ static void aps_dispatch(const struct aps_req *req)
 }
 
 /* ------------------------------------------------------------------------- *
+ * Dispatch task -- see item 4 in the file banner.
+ * ------------------------------------------------------------------------- */
+
+/* Depth 4, as in the source's K_MSGQ_DEFINE(aps_msgq, sizeof(struct aps_req),
+ * 4, 4) -- absorbs a three-write frequency burst (CMD_UPDATE_REG, though,
+ * never actually enters this queue; see below) without dropping a queued
+ * command. Stack size in words (FreeRTOS StackType_t units, not bytes) --
+ * not yet tuned against a real measured high-water mark, carried over as a
+ * reasonable starting guess from the source's 2048-BYTE Zephyr stack.
+ */
+#define APS_TASK_STACK_SIZE_WORDS 512
+#define APS_TASK_PRIORITY 2   /* TODO: not yet verified against a real DMP
+				* project's task priority scheme -- must end up
+				* below whatever priority the generated
+				* Bluetooth stack task(s) run at, mirroring the
+				* source's "priority below the Bluetooth RX
+				* thread" requirement (see the source's own
+				* comment on APS_THREAD_PRIORITY). FreeRTOS
+				* priority numbers are not on the same scale as
+				* Zephyr's, so the source's literal value (7)
+				* does not carry over -- this needs checking
+				* once a real bt_rail_dmp_soc_empty_freertos
+				* project exists and its BLE task priorities
+				* can be read from its own generated code,
+				* same discipline as the RAIL_* vs sl_rail_*
+				* question in sl_subg_radio.c.
+				*/
+#define APS_QUEUE_DEPTH 4
+
+static StackType_t s_aps_task_stack[APS_TASK_STACK_SIZE_WORDS];
+static StaticTask_t s_aps_task_buf;
+static TaskHandle_t s_aps_task_handle;
+
+static uint8_t s_aps_queue_storage[APS_QUEUE_DEPTH * sizeof(struct aps_req)];
+static StaticQueue_t s_aps_queue_buf;
+static QueueHandle_t s_aps_queue;
+
+static void aps_task_fn(void *p_arg)
+{
+	struct aps_req req;
+
+	(void)p_arg;
+
+	while (true) {
+		if (xQueueReceive(s_aps_queue, &req, portMAX_DELAY) != pdTRUE) {
+			continue;
+		}
+		/* Source's Subg_ClrIntFlg(): clear any stale preemption request
+		 * once, here, before the command runs -- must happen from this
+		 * task, immediately before dispatch, not from aps_put_cmd()'s
+		 * caller context, or an abort arriving between enqueue and
+		 * dequeue would be cleared before the command it was meant to
+		 * interrupt ever runs.
+		 */
+		sl_subg_clear_abort();
+		loop_count++;
+		aps_dispatch(&req);
+	}
+}
+
+/* ------------------------------------------------------------------------- *
  * Public API
  * ------------------------------------------------------------------------- */
 
@@ -740,27 +807,14 @@ void aps_put_cmd(const uint8_t *buf, uint16_t len, int8_t rssi)
 	req.len = param_len;
 	memcpy(req.param, &buf[2], param_len);
 
-	/*
-	 * Clear any abort left over from a previous command -- source's
-	 * Subg_ClrIntFlg(), called once before running a command, from the APS
-	 * thread. There is no separate thread here (see the DISPATCH MODEL note
-	 * at the top of this file), so it runs inline, immediately before dispatch,
-	 * which preserves the same ordering relative to the command it precedes.
+	/* Non-blocking send, matching the source's k_msgq_put(..., K_NO_WAIT):
+	 * a full queue drops the command rather than blocking the caller (the
+	 * BLE GATT write callback, once that layer exists) -- losing a command
+	 * to a full queue is preferable to stalling the link.
 	 */
-	sl_subg_clear_abort();
-	loop_count++;
-	aps_dispatch(&req);
-
-	/*
-	 * NOT PORTED: the source's queue-and-preempt logic (k_msgq_put with
-	 * K_NO_WAIT, dropping a command if the queue is full) has no meaning here
-	 * -- there is exactly one command in flight at a time by construction,
-	 * since aps_put_cmd() itself blocks for the duration of
-	 * cmd_get_pkt()/cmd_send_and_listen(). See item 4 in the file banner for
-	 * what this costs: a CMD_UPDATE_REG arriving during a long listen must
-	 * wait for the caller of aps_put_cmd() to be re-entered, rather than being
-	 * serviced from a second thread mid-listen.
-	 */
+	if (xQueueSend(s_aps_queue, &req, 0) != pdTRUE) {
+		APS_LOG_DBG("busy, command 0x%02x dropped", req.cmd);
+	}
 }
 
 void aps_set_active(bool on)
@@ -777,10 +831,17 @@ void aps_set_active(bool on)
 
 void aps_init(void)
 {
-	/* No thread to start -- see the DISPATCH MODEL note at the top of this
-	 * file. sl_subg_radio_init() is the caller's responsibility, same as the
-	 * source (subg_init() is called separately from wherever board init
-	 * happens), not duplicated here.
+	s_aps_queue = xQueueCreateStatic(APS_QUEUE_DEPTH, sizeof(struct aps_req),
+					 s_aps_queue_storage, &s_aps_queue_buf);
+
+	s_aps_task_handle = xTaskCreateStatic(aps_task_fn, "aps",
+					      APS_TASK_STACK_SIZE_WORDS, NULL,
+					      APS_TASK_PRIORITY, s_aps_task_stack,
+					      &s_aps_task_buf);
+
+	/* sl_subg_radio_init() is the caller's responsibility, same as the source
+	 * (subg_init() is called separately from wherever board init happens),
+	 * not duplicated here.
 	 */
 	APS_LOG_INF("APS ready (%s)", APS_SW_VERSION);
 }
