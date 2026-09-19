@@ -49,33 +49,58 @@ project, built and eventually generated through Simplicity Studio 6.
   need no changes here.
 
 - **A radio driver skeleton exists**, `src/drivers/rail/sl_subg_radio.{c,h}`,
-  written against real `sl_rail_*()` signatures pulled from this session's
-  already-fetched copy of `hal_silabs`
-  (`modules/hal/silabs/simplicity_sdk/platform/radio/rail_lib/common/sl_rail.h`
-  in the `orangelink-ncs-ws` workspace) rather than written from memory.
-  **It has not been compiled or run.** Read the TODOs in both files before
-  trusting anything in them -- several real gaps are marked rather than
-  papered over:
+  written against real `RAIL_*()` signatures verified two different ways: by
+  reading the real header on disk (`hal_silabs`, fetched into
+  `orangelink-ncs-ws` this session) and by reading Simplicity Studio's own
+  generated project on disk at
+  `~/SimplicityStudio/v6_workspace/rail_soc_railtest/`. **It has not been
+  compiled or run.** Two real, substantive corrections happened while writing
+  it, both worth keeping on record rather than quietly fixing:
 
-  - The generated channel config symbol this driver needs to call
-    `sl_rail_config_channels()` with does not exist in this tree yet (it is
-    only inside the Studio project's own `autogen/`, not exported here).
-    Without it, `sl_subg_radio_init()` never actually applies the PHY.
-  - `sl_rail_set_rx_fifo()`'s exact parameter order was not verified this
-    session (only its existence, by line-number search).
+  1. **API family, corrected once already.** `RAIL_Init`/`RAIL_StartTx`/
+     `RAIL_StartRx`/`RAIL_ConfigChannels` (PascalCase) are marked
+     `@deprecated` in this SDK's header comments, in favour of a newer
+     lowercase `sl_rail_*()` family. The driver was first written against
+     `sl_rail_*` on that basis. That was wrong: Simplicity Studio's own
+     Radio Configurator generates `RAIL_ChannelConfig_t` (the *old* type,
+     named `MDT_OOK_channelConfig`, in `autogen/rail_config.c`) for this
+     exact project, and its own generated init glue
+     (`autogen/sl_rail_util_init.c`) calls `RAIL_Init`/`RAIL_ConfigData`/
+     `RAIL_ConfigChannels` throughout -- not one `sl_rail_*` call anywhere in
+     it. The deprecation tags are real, but this project template is built on
+     the "deprecated" API regardless, and the two families are not
+     interchangeable -- passing the generated `RAIL_ChannelConfig_t` to
+     `sl_rail_config_channels()` (which takes `sl_rail_channel_config_t`)
+     would be a straight type mismatch. Caught by reading the real generated
+     file rather than trusting the header comments in isolation, but only
+     after the first version was already written and briefly committed.
+
+  2. **Bring-up should call the generated `sl_rail_util_init()`**
+     (`autogen/sl_rail_util_init.h`), not reimplement
+     `RAIL_Init`+`RAIL_ConfigChannels` by hand -- it is Silicon Labs' own
+     tested glue, already wired to the real `channelConfigs[]`/
+     `MDT_OOK_channelConfig`, including calibration and PA setup this driver
+     has no reason to reimplement. `sl_rail_util_get_handle(SL_RAIL_UTIL_HANDLE_INST0)`
+     retrieves the resulting handle afterward.
+
+  Real, still-open gaps, marked rather than papered over:
+
+  - This driver's own `rail_events_callback()` is defined but **not actually
+    wired into RAIL's dispatch** -- `sl_rail_util_init()` installs its own
+    internal callback (`sli_rail_util_on_event`) as part of bring-up, and
+    this driver's handler is not yet chained into that. Without resolving
+    this, the FIFO-drain-on-event logic the whole receive path depends on
+    simply never runs.
+  - `RAIL_SetRxFifo()`'s exact parameter order was checked this time
+    (`RAIL_Handle_t, uint8_t *addr, uint16_t *size`) -- confirmed, not
+    assumed.
   - Blocking waits (`wait_for_rx_data_or_timeout()`, the TX-done wait) are
     written as placeholder busy-spins, explicitly marked as such. They need
     whatever real synchronization primitive the eventual RTOS/bare-metal
-    environment provides -- not yet known, since it depends on which
-    project template (bare RAILtest vs. an RTOS-based Bluetooth+DMP example)
-    this becomes.
+    environment provides -- not yet known, since it depends on which project
+    template (bare RAILtest vs. an RTOS-based Bluetooth+DMP example) this
+    becomes.
   - TX power control has no verified API name at all and is stubbed to fail.
-
-- **Important correction already made once**: `RAIL_Init`/`RAIL_StartTx`/
-  `RAIL_StartRx`/`RAIL_ConfigChannels` (PascalCase, "RAIL 2.x") are marked
-  `@deprecated` in this SDK generation. The live API is the lowercase
-  `sl_rail_*()` family ("RAIL 3"). This was caught before any code was
-  written against the deprecated names, not after.
 
 ## What is not started
 
@@ -91,10 +116,19 @@ project, built and eventually generated through Simplicity Studio 6.
 ## Provenance
 
 Every RAIL fact in this README and in the driver skeleton's comments was
-checked against real header/source files fetched into
-`orangelink-ncs-ws/modules/hal/silabs` this session (pinned to Zephyr's own
-`hal_silabs` revision, `f5201210afa1319ed8dd8dbe21682bcb63b25771` -- not
-necessarily identical to whatever exact RAIL version Simplicity Studio
-6 / SDK Suite 2026.6.1 itself ships, which is worth reconciling once the
-real project is exported). Where something could not be grounded that way,
-it is marked TODO rather than asserted.
+checked against one of two real sources, not recalled from memory:
+
+- header/source files fetched into `orangelink-ncs-ws/modules/hal/silabs`
+  this session (pinned to Zephyr's own `hal_silabs` revision,
+  `f5201210afa1319ed8dd8dbe21682bcb63b25771`), or
+- Simplicity Studio's own generated project, live on this machine at
+  `~/SimplicityStudio/v6_workspace/rail_soc_railtest/`, built against SDK
+  Suite 2026.6.1.
+
+The second source is what actually caught the RAIL_*/sl_rail_* mistake --
+the header comments alone (from the first source) said the wrong thing
+("use sl_rail_*, RAIL_* is deprecated") in a way that sounded authoritative
+but did not match what Silicon Labs' own generator and generated init glue
+actually do. Prefer checking the live generated project over the vendored
+headers alone when the two could plausibly disagree. Where neither source
+resolved something, it is marked TODO rather than asserted.

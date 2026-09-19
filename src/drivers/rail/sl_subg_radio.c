@@ -2,14 +2,17 @@
  * Sub-GHz radio driver -- EFR32xG28 native RAIL, 916 MHz Minimed only.
  * SPDX-License-Identifier: GPL-2.0-only
  *
- * See sl_subg_radio.h for what this replaces and why its shape differs from
- * the RFM69 driver. Every sl_rail_*() call below was checked against the real
- * header (modules/hal/silabs/.../rail_lib/common/sl_rail.h, this workspace,
- * this session) before being written -- not recalled from memory or general
- * RAIL familiarity, given how many assumptions about this SDK turned out
- * wrong earlier in the same session (RAIL 2.x being the live API; the OOK
- * config gap implying infeasibility; the 400 kHz channel bandwidth carried
- * over from the RFM69 instead of this chip's own calculated value).
+ * See sl_subg_radio.h for what this replaces, why its shape differs from the
+ * RFM69 driver, and the API-family correction made before this rewrite (RAIL_*,
+ * not sl_rail_* -- the "deprecated" PascalCase functions are what Silicon
+ * Labs' own Radio Configurator output and generated init glue actually use
+ * for this project).
+ *
+ * Every RAIL_*() call below was checked against the real header
+ * (modules/hal/silabs/.../rail_lib/common/rail.h, this workspace) or against
+ * Silicon Labs' own generated code in
+ * SimplicityStudio/v6_workspace/rail_soc_railtest/autogen/, not recalled from
+ * memory.
  *
  * NOT YET COMPILED OR RUN. There is no hardware to run it on yet. Treat this
  * as a grounded starting skeleton, not a finished driver -- see the TODOs.
@@ -18,38 +21,20 @@
 #include <string.h>
 
 #include "sl_subg_radio.h"
-#include "sl_rail.h"
-#include "sl_rail_types.h"
+#include "rail.h"
+#include "rail_types.h"
+#include "sl_rail_util_init.h"   /* sl_rail_util_init(), sl_rail_util_get_handle() */
 
-/*
- * TODO: the generated channel config table.
- *
- * Simplicity Studio's Radio Configurator emits a const sl_rail_channel_config_t
- * (plus supporting modem-config arrays) for the MDT_OOK-Channel_Group_1
- * protocol built this session -- the real analogue of rf69_cfg_916[] on the
- * RFM69 side, except generated rather than hand-written, and it is what
- * actually encodes the 16.384 kbps / OOK / preamble / sync / framing settings
- * configured in Studio. It does not exist in this tree yet: it is emitted
- * into the Studio project's own autogen/ directory, which has not been
- * exported and copied in here. sl_subg_radio_init() cannot correctly call
- * sl_rail_config_channels() without it -- the extern declaration below is a
- * placeholder for that symbol, named to match Studio's own naming convention
- * (protocol name + "_channelConfig") seen in the vendored per-chip generated
- * examples inspected this session, but NOT verified against this project's
- * actual output.
- */
-extern const sl_rail_channel_config_t MDT_OOK_channelConfig[];
+static RAIL_Handle_t s_rail_handle;
 
-static sl_rail_handle_t s_rail_handle;
-
-/* TX/RX FIFO buffers. RAIL requires these word-aligned (sl_rail_fifo_buffer_align_t
- * in the real header) and sized as a power of two in most RAIL generations --
- * TODO: confirm the power-of-two requirement still holds in this SDK release
- * before relying on 128 here; not independently verified this session.
+/* TX/RX FIFO buffers. RAIL_SetTxFifo/RAIL_SetRxFifo take plain uint8_t*
+ * buffers (confirmed from the real signatures, unlike the sl_rail_* family's
+ * word-aligned sl_rail_fifo_buffer_align_t type this file previously assumed
+ * by analogy rather than checking directly for the RAIL_* equivalent).
  */
 #define SL_SUBG_FIFO_BYTES 128U
-static sl_rail_fifo_buffer_align_t s_tx_fifo[SL_SUBG_FIFO_BYTES / sizeof(sl_rail_fifo_buffer_align_t)];
-static sl_rail_fifo_buffer_align_t s_rx_fifo[SL_SUBG_FIFO_BYTES / sizeof(sl_rail_fifo_buffer_align_t)];
+static uint8_t s_tx_fifo[SL_SUBG_FIFO_BYTES];
+static uint8_t s_rx_fifo[SL_SUBG_FIFO_BYTES];
 
 static uint8_t s_rx_buf[SL_SUBG_MAX_PKT_LEN];
 static uint8_t s_rx_count;
@@ -84,19 +69,28 @@ static void wait_for_rx_data_or_timeout(uint32_t timeout_ms)
  * bitmask rather than a single GPIO edge, so there is no separate "which
  * interrupt fired" step.
  *
- * SL_RAIL_EVENT_RX_FIFO_ALMOST_FULL is the direct analogue of DIO1 mapped to
+ * RAIL_EVENT_RX_FIFO_ALMOST_FULL is the direct analogue of DIO1 mapped to
  * FifoNotEmpty: it fires as bytes become available, before the packet (by our
  * own fixed-length declaration, up to 107 bytes) is complete. Draining here
  * and watching for the 0x00 terminator reproduces subg_get_pkt()'s existing
  * "terminate on a sentinel byte, do not wait for the radio's own notion of
  * packet-complete" behaviour.
+ *
+ * TODO: this needs to be wired into RAIL_Config_t::eventsCallback. The
+ * generated sl_rail_util_init_inst0() already installs its OWN callback
+ * (sli_rail_util_on_event) as part of bring-up -- this driver's callback is
+ * not yet hooked into that chain. Either this function needs to be called
+ * from inside sli_rail_util_on_event (not ours to edit, it is generated), or
+ * RAIL_ConfigEvents() needs to be re-armed with our own handler after
+ * sl_rail_util_init() completes. Not resolved yet -- flagged rather than
+ * silently assumed to work.
  */
-static void rail_events_callback(sl_rail_handle_t handle, sl_rail_events_t events)
+static void rail_events_callback(RAIL_Handle_t handle, RAIL_Events_t events)
 {
-	if (events & SL_RAIL_EVENT_RX_FIFO_ALMOST_FULL) {
+	if (events & RAIL_EVENT_RX_FIFO_ALMOST_FULL) {
 		while (s_rx_count < SL_SUBG_MAX_PKT_LEN) {
 			uint8_t byte;
-			uint16_t got = sl_rail_read_rx_fifo(handle, &byte, 1);
+			uint16_t got = RAIL_ReadRxFifo(handle, &byte, 1);
 
 			if (got == 0) {
 				break;
@@ -110,61 +104,70 @@ static void rail_events_callback(sl_rail_handle_t handle, sl_rail_events_t event
 		}
 	}
 
-	if (events & SL_RAIL_EVENT_TX_PACKET_SENT) {
+	if (events & RAIL_EVENT_TX_PACKET_SENT) {
 		s_tx_done = true;
 	}
 
-	/* TODO: SL_RAIL_EVENT_RX_FIFO_OVERFLOW / SL_RAIL_EVENT_RX_FIFO_FULL are
-	 * real, named events in sl_rail_types.h and are not handled here yet --
-	 * on the RFM69 side an equivalent overrun is a silent data-corruption
-	 * risk that was specifically designed around (REG_IRQFLAGS2 FIFOOVERRUN
-	 * handling in rf69_cfg_916[]). Needs the same care here before this is
-	 * trusted against real traffic.
+	/* TODO: RAIL_EVENT_RX_FIFO_OVERFLOW is a real, named event and is not
+	 * handled here yet -- on the RFM69 side an equivalent overrun is a
+	 * silent data-corruption risk that was specifically designed around
+	 * (REG_IRQFLAGS2 FIFOOVERRUN handling in rf69_cfg_916[]). Needs the same
+	 * care here before this is trusted against real traffic.
 	 */
 }
 
 int sl_subg_radio_init(void)
 {
-	sl_rail_config_t config = {
-		.events_callback = rail_events_callback,
-	};
-	sl_rail_status_t st;
+	uint16_t rx_size = SL_SUBG_FIFO_BYTES;
+	uint16_t got;
+	RAIL_Status_t st;
 
-	st = sl_rail_init(&s_rail_handle, &config, NULL);
-	if (st != SL_RAIL_STATUS_NO_ERROR) {
-		return -1;
-	}
-
-	st = sl_rail_set_tx_fifo(s_rail_handle, s_tx_fifo, SL_SUBG_FIFO_BYTES, 0, 0);
-	if (st != SL_RAIL_STATUS_NO_ERROR) {
-		return -1;
-	}
-
-	/* TODO: sl_rail_set_rx_fifo()'s exact signature was not pulled this
-	 * session (only referenced by line number while looking for the
-	 * threshold function) -- confirm its parameter order matches
-	 * set_tx_fifo's before trusting this call as written.
+	/*
+	 * Bring RAIL up via Silicon Labs' own generated bring-up, not a hand
+	 * rolled RAIL_Init()/RAIL_ConfigChannels() pair -- it is already wired to
+	 * the real MDT_OOK channel config (autogen/rail_config.c) and to
+	 * calibration/PA setup this driver has no reason to reimplement.
 	 */
-	st = sl_rail_set_rx_fifo(s_rail_handle, s_rx_fifo, SL_SUBG_FIFO_BYTES);
-	if (st != SL_RAIL_STATUS_NO_ERROR) {
-		return -1;
-	}
-
-	(void)sl_rail_set_rx_fifo_threshold(s_rail_handle, SL_SUBG_FIFO_BYTES / 2);
-
-	st = sl_rail_config_events(s_rail_handle,
-				   SL_RAIL_EVENT_RX_FIFO_ALMOST_FULL | SL_RAIL_EVENT_TX_PACKET_SENT,
-				   SL_RAIL_EVENT_RX_FIFO_ALMOST_FULL | SL_RAIL_EVENT_TX_PACKET_SENT);
-	if (st != SL_RAIL_STATUS_NO_ERROR) {
-		return -1;
-	}
-
-	/* TODO: sl_rail_config_channels(s_rail_handle, MDT_OOK_channelConfig, ...)
-	 * belongs here -- not yet called, because the channel config symbol
-	 * above is an unverified placeholder, not real generated output. Without
-	 * this call the PHY configured in Studio is never actually applied to
-	 * the radio, so nothing above this line is sufficient on its own yet.
+	/*
+	 * sl_rail_util_init() already APP_ASSERT()s internally on failure (seen
+	 * in the generated sl_rail_util_init_inst0(): "RAIL_Init failed" halts
+	 * execution rather than returning), so a real failure would not reach
+	 * this line at all -- this check is defensive, not a confirmed way to
+	 * detect failure. RAIL_EFR32_HANDLE is documented as a pre-init
+	 * placeholder value, not a guaranteed post-init failure sentinel, so
+	 * treat this comparison as a best-effort guard, not a verified contract.
 	 */
+	sl_rail_util_init();
+	s_rail_handle = sl_rail_util_get_handle(SL_RAIL_UTIL_HANDLE_INST0);
+	if (s_rail_handle == RAIL_EFR32_HANDLE) {
+		return -1;
+	}
+
+	got = RAIL_SetTxFifo(s_rail_handle, s_tx_fifo, 0, SL_SUBG_FIFO_BYTES);
+	if (got != SL_SUBG_FIFO_BYTES) {
+		return -1;
+	}
+
+	st = RAIL_SetRxFifo(s_rail_handle, s_rx_fifo, &rx_size);
+	if (st != RAIL_STATUS_NO_ERROR) {
+		return -1;
+	}
+
+	(void)RAIL_SetRxFifoThreshold(s_rail_handle, SL_SUBG_FIFO_BYTES / 2);
+
+	st = RAIL_ConfigEvents(s_rail_handle,
+			       RAIL_EVENT_RX_FIFO_ALMOST_FULL | RAIL_EVENT_TX_PACKET_SENT,
+			       RAIL_EVENT_RX_FIFO_ALMOST_FULL | RAIL_EVENT_TX_PACKET_SENT);
+	if (st != RAIL_STATUS_NO_ERROR) {
+		return -1;
+	}
+
+	/* TODO: see rail_events_callback()'s comment -- this driver's callback is
+	 * not yet actually reachable from RAIL's dispatch. sl_rail_util_init()
+	 * installs its own eventsCallback internally; ours needs to be chained in,
+	 * not just defined.
+	 */
+	(void)rail_events_callback;
 
 	return 0;
 }
@@ -174,8 +177,8 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
 {
 	for (uint8_t i = 0; i <= repeat_cnt; i++) {
 		s_tx_done = false;
-		sl_rail_write_tx_fifo(s_rail_handle, data, len, true);
-		sl_rail_start_tx(s_rail_handle, SL_SUBG_CHANNEL, 0, NULL);
+		RAIL_WriteTxFifo(s_rail_handle, data, len, true);
+		RAIL_StartTx(s_rail_handle, SL_SUBG_CHANNEL, RAIL_TX_OPTIONS_DEFAULT, NULL);
 
 		/* TODO: bounded wait on s_tx_done, same caveat as
 		 * wait_for_rx_data_or_timeout() -- needs a real blocking
@@ -197,11 +200,11 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 	s_rx_count = 0;
 	s_rx_have_data = false;
 
-	sl_rail_start_rx(s_rail_handle, SL_SUBG_CHANNEL, NULL);
+	RAIL_StartRx(s_rail_handle, SL_SUBG_CHANNEL, NULL);
 
 	wait_for_rx_data_or_timeout(timeout_ms);
 
-	sl_rail_idle(s_rail_handle, 0 /* TODO: real idle-mode enum value */, true);
+	RAIL_Idle(s_rail_handle, RAIL_IDLE, true);
 
 	if (s_abort_flag) {
 		return SL_SUBG_RX_INTERRUPTED;
@@ -210,7 +213,7 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 		return SL_SUBG_RX_TIMEOUT;
 	}
 
-	s_last_rssi_dbm = sl_rail_get_rssi(s_rail_handle, 0);
+	s_last_rssi_dbm = RAIL_GetRssi(s_rail_handle, false);
 	memcpy(buf, s_rx_buf, s_rx_count);
 	*len = s_rx_count;
 	return SL_SUBG_RX_OK;
@@ -234,7 +237,7 @@ int16_t sl_subg_get_last_rssi(void)
 int sl_subg_set_power_level(int16_t dbm)
 {
 	(void)dbm;
-	/* TODO: not implemented. Needs the real sl_rail TX power API, which
+	/* TODO: not implemented. Needs the real RAIL TX power API, which
 	 * was not pinned down this session -- do not guess a function name.
 	 */
 	return -1;
