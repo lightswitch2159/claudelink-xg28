@@ -96,5 +96,13 @@ for f in 4b6b manchester; do
 	echo "OK: $f.c"
 done
 
+echo "=== protocol layer (aps) -- no SDK deps, only the driver header ==="
+APS_INCLUDES=(-I"$REPO/src" -I"$REPO/src/aps" -I"$REPO/src/drivers/rail" -I"$REPO/src/encoding")
+for f in aps aps_transport; do
+	"$GCC" -fsyntax-only -mcpu=cortex-m33 -mthumb -std=c11 -Wall -Wextra \
+		"${APS_INCLUDES[@]}" "$REPO/src/aps/$f.c"
+	echo "OK: $f.c"
+done
+
 echo
 echo "All clean."

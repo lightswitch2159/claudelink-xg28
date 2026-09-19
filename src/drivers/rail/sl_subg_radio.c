@@ -46,6 +46,9 @@ static volatile bool s_rx_have_data;
 static volatile bool s_tx_done;
 static volatile bool s_abort_flag;
 static int16_t s_last_rssi_dbm = INT16_MIN;
+static uint16_t s_rx_pkt_count;
+static uint16_t s_tx_pkt_count;
+static uint16_t s_channel = SL_SUBG_CHANNEL;
 
 /*
  * TODO: replaced with whatever this project's actual environment provides
@@ -184,7 +187,7 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
 	for (uint8_t i = 0; i <= repeat_cnt; i++) {
 		s_tx_done = false;
 		RAIL_WriteTxFifo(s_rail_handle, data, len, true);
-		RAIL_StartTx(s_rail_handle, SL_SUBG_CHANNEL, RAIL_TX_OPTIONS_DEFAULT, NULL);
+		RAIL_StartTx(s_rail_handle, s_channel, RAIL_TX_OPTIONS_DEFAULT, NULL);
 
 		/* TODO: bounded wait on s_tx_done, same caveat as
 		 * wait_for_rx_data_or_timeout() -- needs a real blocking
@@ -198,6 +201,7 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
 			/* TODO: real delay primitive. */
 		}
 	}
+	s_tx_pkt_count++;
 	return 0;
 }
 
@@ -206,7 +210,7 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 	s_rx_count = 0;
 	s_rx_have_data = false;
 
-	RAIL_StartRx(s_rail_handle, SL_SUBG_CHANNEL, NULL);
+	RAIL_StartRx(s_rail_handle, s_channel, NULL);
 
 	wait_for_rx_data_or_timeout(timeout_ms);
 
@@ -222,6 +226,7 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 	s_last_rssi_dbm = RAIL_GetRssi(s_rail_handle, false);
 	memcpy(buf, s_rx_buf, s_rx_count);
 	*len = s_rx_count;
+	s_rx_pkt_count++;
 	return SL_SUBG_RX_OK;
 }
 
@@ -242,9 +247,51 @@ int16_t sl_subg_get_last_rssi(void)
 
 int sl_subg_set_power_level(int16_t dbm)
 {
-	(void)dbm;
-	/* TODO: not implemented. Needs the real RAIL TX power API, which
-	 * was not pinned down this session -- do not guess a function name.
+	/* RAIL_SetTxPowerDbm() takes DECI-dBm (rail.h doc example: "100 deci-dBm,
+	 * 10 dBm") -- see the header note on this function for the RFM69-driver
+	 * contrast (raw PA register value there, whole dBm here).
 	 */
-	return -1;
+	RAIL_Status_t st = RAIL_SetTxPowerDbm(s_rail_handle, (RAIL_TxPower_t)(dbm * 10));
+
+	return (st == RAIL_STATUS_NO_ERROR) ? 0 : -1;
+}
+
+uint16_t sl_subg_get_rx_count(void)
+{
+	return s_rx_pkt_count;
+}
+
+uint16_t sl_subg_get_tx_count(void)
+{
+	return s_tx_pkt_count;
+}
+
+int sl_subg_set_freq(uint32_t hz)
+{
+	if (hz < SL_SUBG_BASE_FREQ_HZ) {
+		return -1;
+	}
+
+	uint32_t n = (hz - SL_SUBG_BASE_FREQ_HZ + SL_SUBG_CHANNEL_SPACING_HZ / 2)
+		     / SL_SUBG_CHANNEL_SPACING_HZ;
+
+	/* SL_SUBG_CHANNEL_MIN is 0, so n (unsigned) is never below it -- only the
+	 * upper bound is a real check.
+	 */
+	if (n > SL_SUBG_CHANNEL_MAX) {
+		return -1;
+	}
+
+	s_channel = (uint16_t)n;
+	return 0;
+}
+
+uint32_t sl_subg_get_freq(void)
+{
+	return SL_SUBG_BASE_FREQ_HZ + (uint32_t)s_channel * SL_SUBG_CHANNEL_SPACING_HZ;
+}
+
+void sl_subg_reset_radio_cfg(void)
+{
+	s_channel = SL_SUBG_CHANNEL;
 }
