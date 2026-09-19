@@ -120,17 +120,54 @@ project, built and eventually generated through Simplicity Studio 6.
     environment provides -- not yet known, since it depends on which project
     template (bare RAILtest vs. an RTOS-based Bluetooth+DMP example) this
     becomes.
-  - TX power control has no verified API name at all and is stubbed to fail.
+  - TX power control now calls a real API, `RAIL_SetTxPowerDbm()` (confirmed
+    from the real `rail.h` this session -- deci-dBm units, not the RFM69
+    driver's raw PA register value). Not hardware-verified, and depends on
+    `RAIL_ConfigTxPower()` having already run during `sl_rail_util_init()`,
+    which is expected but not independently confirmed for this exact project.
+  - Frequency control (`sl_subg_set_freq`/`sl_subg_get_freq`) was added for
+    the protocol layer below to call. RAIL has no arbitrary-Hz tune, only
+    channel selection, so these map a requested Hz onto the nearest channel of
+    the static channel config (`SL_SUBG_BASE_FREQ_HZ` + n \*
+    `SL_SUBG_CHANNEL_SPACING_HZ`, channels 0-20) rather than reconfiguring the
+    PHY.
+
+- **The APS protocol layer is ported.** `src/aps/aps.{c,h}` -- the RileyLink
+  command handler (`subg_rfspy 2.2`: `CMD_GET_STATE`, `CMD_SEND_PKT`,
+  `CMD_SEND_AND_LISTEN`, register read/write, statistics, etc.) -- from
+  `orangelink-ncs:feather-nrf52832`. Command parsing, the CC111x-style
+  register encoding, the overflow bounds check, and the deferred-frequency-
+  write reasoning are carried over unchanged; none of it is RFM69-specific.
+  What did change, in full in `aps.c`'s file banner:
+
+  - Radio calls go through `sl_subg_*()` instead of `rf69_*()`/`subg_*()`.
+  - `ips_send_response()` (BLE-specific) is replaced by `aps_transport_send()`
+    (new `src/aps/aps_transport.h`/`.c`), a narrow interface with a weak
+    no-op default -- the same weak-symbol-override pattern already used for
+    `sl_rail_util_on_event()`, one layer up, so this compiles and its command
+    parsing is testable before a BLE layer exists.
+  - Zephyr's thread+message-queue dispatch, byte-order helpers, and logging
+    macros are gone (this is not a Zephyr build). `aps_put_cmd()` now
+    dispatches **synchronously and inline** rather than handing off to a
+    dedicated thread. This is a real, deliberate regression from the source,
+    not a cosmetic substitution: the source's thread exists specifically so a
+    multi-second `CMD_SEND_AND_LISTEN` doesn't stall whatever else needs to
+    run (there, the BLE stack) -- without it, nothing else can run during a
+    long listen. It is written this way because the RTOS/bare-metal question
+    is still open (same open question as the driver's blocking-wait
+    placeholders below), so there is no queue/thread primitive to port to
+    yet. Revisit once that's settled.
+
+  Verified to compile clean, zero warnings, alongside the driver
+  (`tools/check_compile.sh` now covers `src/aps/*.c` too).
 
 ## What is not started
 
 - BLE side entirely -- no work yet on Silicon Labs' native Bluetooth stack
-  or the Dynamic Multiprotocol coexistence structure.
-- The `aps.c`/`subg.c` protocol layer has not been ported. It is mostly
-  hardware-independent policy logic in the RFM69 version and should port
-  with modest changes once this driver's operations
-  (`sl_subg_send_pkt`/`sl_subg_get_pkt`/RSSI) are real, but that has not been
-  attempted.
+  or the Dynamic Multiprotocol coexistence structure. `aps_transport_send()`
+  has no real implementation to hand responses to yet.
+- The synchronous-dispatch deviation in `aps.c` (above) needs revisiting once
+  an RTOS/bare-metal decision is made.
 - Nothing has run on real hardware. The board has not arrived yet.
 
 ## Provenance
