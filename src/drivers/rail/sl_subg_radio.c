@@ -14,8 +14,12 @@
  * SimplicityStudio/v6_workspace/rail_soc_railtest/autogen/, not recalled from
  * memory.
  *
- * NOT YET COMPILED OR RUN. There is no hardware to run it on yet. Treat this
- * as a grounded starting skeleton, not a finished driver -- see the TODOs.
+ * Verified to compile clean (zero errors, zero warnings with -Wall -Wextra)
+ * against the real project's exact toolchain, include paths, and defines --
+ * see tools/check_compile.sh, which extracts that configuration directly
+ * from the live generated project rather than hand-maintaining a copy. NOT
+ * YET RUN: there is no hardware to run it on. Treat this as a compile-clean
+ * starting skeleton, not a hardware-validated driver -- see the TODOs.
  */
 
 #include <string.h>

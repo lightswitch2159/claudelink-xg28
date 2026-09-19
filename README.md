@@ -1,8 +1,15 @@
 # Orangelink -- EFR32xG28 (native Simplicity SDK)
 
-Status: **early scaffolding, not building yet.** No hardware exists for this
-board on the bench. This is a starting skeleton written against real,
-verified RAIL API signatures, not a working driver.
+Status: **compiles clean, not run yet.** No hardware exists for this board on
+the bench, so nothing has executed -- but every file in `src/` now passes a
+real `-fsyntax-only` compile against the exact toolchain, include paths, and
+preprocessor defines Simplicity Studio's own generated project uses for this
+board (`tools/check_compile.sh`, reproducible, extracts its flags directly
+from the live generated project rather than hand-maintaining a copy). Zero
+errors, zero warnings with `-Wall -Wextra`. That is a real, if partial,
+verification -- every header include resolves, every `RAIL_*()` call site
+matches its actual declared signature, every constant used is real -- not
+just a plausible-looking skeleton.
 
 ## What this is
 
@@ -53,9 +60,12 @@ project, built and eventually generated through Simplicity Studio 6.
   reading the real header on disk (`hal_silabs`, fetched into
   `orangelink-ncs-ws` this session) and by reading Simplicity Studio's own
   generated project on disk at
-  `~/SimplicityStudio/v6_workspace/rail_soc_railtest/`. **It has not been
-  compiled or run.** Two real, substantive corrections happened while writing
-  it, both worth keeping on record rather than quietly fixing:
+  `~/SimplicityStudio/v6_workspace/rail_soc_railtest/`. **Verified to compile
+  clean** against that project's exact real toolchain/include/define set
+  (`tools/check_compile.sh`) -- not run on hardware, but a real, non-trivial
+  check, not just a plausible-looking skeleton. Two real, substantive
+  corrections happened while writing it, both worth keeping on record rather
+  than quietly fixing:
 
   1. **API family, corrected once already.** `RAIL_Init`/`RAIL_StartTx`/
      `RAIL_StartRx`/`RAIL_ConfigChannels` (PascalCase) are marked
