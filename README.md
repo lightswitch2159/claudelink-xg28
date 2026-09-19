@@ -30,10 +30,12 @@ project, built and eventually generated through Simplicity Studio 6.
 
 ## What is real so far
 
-- **The radio PHY is configured and saved in Studio**, built from the
-  `RAIL - SoC RAILtest` example against the BRD2705A board target, protocol
-  renamed `MDT_OOK`. Every field checked against the working RFM69 driver's
-  own `rf69_cfg_916[]` register table (from `orangelink-ncs`,
+- **The radio PHY is configured in both projects now.** Originally built in
+  `rail_soc_railtest` (`RAIL - SoC RAILtest` example, bare RAIL, kept as the
+  `RAIL_*` API reference) and, this session, re-applied field-for-field to
+  `rail_bt_dmp_soc_range_test`'s own Radio Configurator -- the project the
+  driver actually integrates with. Every field checked against the working
+  RFM69 driver's own `rf69_cfg_916[]` register table (from `orangelink-ncs`,
   `feather-nrf52832` branch) or, where this chip's physics genuinely differs
   from the RFM69's (channel acquisition bandwidth), against the
   Configurator's own calculated value rather than a cross-chip guess:
@@ -50,9 +52,26 @@ project, built and eventually generated through Simplicity Studio 6.
   | Frame bit endian | MSB_FIRST |
   | CRC | off |
 
-  Not yet exported from Studio into this tree -- the generated
-  `autogen/`/config source Studio produces for this PHY has not been copied
-  in here yet.
+  Confirmed by reading `rail_bt_dmp_soc_range_test`'s real saved
+  `config/rail/radio_settings.radioconf` after saving in Studio (not just
+  trusting the GUI fields) -- every value above is a real
+  `<profile_inputs>` entry there (`payload_crc_en: false`,
+  `base_frequency_hz: 916000000`, `syncword_0: 4278255360` = `0xFF00FF00`,
+  etc.), and the channel entry is named `MDT_OOK`, generating the symbol
+  `RAIL0_MDT_OOK_PROFILE_BASE` in `autogen/rail_config.h`. One real,
+  worth-noting detail from reading the generated init glue while confirming
+  this: `autogen/rail_config.c` emits the legacy `RAIL_ChannelConfig_t` type
+  regardless of which `rail_util_init` component variant a project uses
+  (Radio Configurator output format appears fixed to `rail_api_2.x`,
+  independent of the `RAIL_*`/`sl_rail_*` question elsewhere), and
+  `autogen/sl_rail_util_init.c` bridges it with an explicit
+  `(const sl_rail_channel_config_t *)` cast before calling
+  `sl_rail_config_channels()` -- Silicon Labs' own generated code doing the
+  two-API-family bridging internally. Does not affect this driver, which
+  never touches `channelConfigs[]` directly (goes through
+  `sl_rail_util_init()`/`sl_rail_util_get_handle()`), but confirms the two
+  families are meant to coexist this way rather than the project generation
+  being inconsistent.
 
 - **The encoding layer is ported verbatim.** `src/encoding/4b6b.{c,h}` and
   `manchester.{c,h}` are byte-identical copies from `orangelink-ncs`
@@ -154,10 +173,6 @@ project, built and eventually generated through Simplicity Studio 6.
     depends on TX power having already been configured during
     `sl_rail_util_init()` -- not independently confirmed for this exact
     project's autogen output.
-  - The radio PHY settings table above (OOK, 16.384 kbps, etc.) was
-    configured in `rail_soc_railtest`'s Radio Configurator, not yet
-    re-applied to `rail_bt_dmp_soc_range_test` -- that's the next concrete
-    step, see "What is not started".
 
 - **The APS protocol layer is ported.** `src/aps/aps.{c,h}` -- the RileyLink
   command handler (`subg_rfspy 2.2`: `CMD_GET_STATE`, `CMD_SEND_PKT`,
@@ -208,11 +223,6 @@ project, built and eventually generated through Simplicity Studio 6.
 - BLE side entirely -- no work yet on Silicon Labs' native Bluetooth stack
   or the Dynamic Multiprotocol coexistence structure. `aps_transport_send()`
   has no real implementation to hand responses to yet.
-- **Re-apply the RAIL PHY settings** (the OOK/16.384kbps/etc. table above,
-  currently only configured in `rail_soc_railtest`'s Radio Configurator) to
-  `rail_bt_dmp_soc_range_test`'s own Radio Configurator -- needed before this
-  project's radio actually matches the pump's PHY. Needs Simplicity Studio's
-  GUI, same as the original configuration was done.
 - **`APS_TASK_PRIORITY` needs tuning** against this project's real Bluetooth
   task priorities (see above) -- not yet read from the generated project.
 - Nothing has run on real hardware. The board has not arrived yet.
