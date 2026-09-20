@@ -1,13 +1,32 @@
 /*
  * Core Bluetooth application logic -- APS/BLE bridge.
- * SPDX-License-Identifier: GPL-2.0-only
  *
- * Replaces the generated skeleton of the same name from the
- * "Bluetooth RAIL DMP - SoC Empty Micrium OS" example this project was
- * imported from (Silicon Labs, Zlib-licensed -- see git history for the
- * original file). That skeleton's `sl_bt_on_event()` only advertised and
- * tracked connection open/close; everything below the boot/connection cases
- * is new.
+ * The boot case of sl_bt_on_event() below (advertising set creation, timing,
+ * start) is substantially unchanged from the generated skeleton of this file
+ * from Silicon Labs' "Bluetooth RAIL DMP - SoC Empty Micrium OS" example, so
+ * that file's own notice is kept rather than just cited:
+ *
+ *   Copyright 2020 Silicon Laboratories Inc. www.silabs.com
+ *   SPDX-License-Identifier: Zlib
+ *   This software is provided 'as-is', without any express or implied
+ *   warranty. In no event will the authors be held liable for any damages
+ *   arising from the use of this software. Permission is granted to anyone
+ *   to use this software for any purpose, including commercial
+ *   applications, and to alter it and redistribute it freely, subject to
+ *   the following restrictions: (1) the origin of this software must not be
+ *   misrepresented; you must not claim that you wrote the original
+ *   software -- an acknowledgment in the product documentation would be
+ *   appreciated but is not required; (2) altered source versions must be
+ *   plainly marked as such, and must not be misrepresented as being the
+ *   original software; (3) this notice may not be removed or altered from
+ *   any source distribution.
+ *
+ * Everything from sl_bt_evt_gatt_server_attribute_value_id onward, and the
+ * connection-lifecycle handling, is new -- SPDX-License-Identifier for that
+ * part: GPL-2.0-only, consistent with the rest of this repository. The
+ * connection_opened/connection_closed cases add real behaviour (tracking
+ * active_connection, aps_set_active()) on top of the original's bare
+ * advertising-restart logic.
  *
  * This file is the entire BLE side of the RileyLink emulation: it dispatches
  * GATT writes on the IPS Data characteristic into aps_put_cmd(), and provides

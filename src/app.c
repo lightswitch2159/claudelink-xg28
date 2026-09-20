@@ -2,19 +2,13 @@
  * Application entry point.
  * SPDX-License-Identifier: GPL-2.0-only
  *
- * Replaces the generated skeleton of the same name from the
- * "Bluetooth RAIL DMP - SoC Empty Micrium OS" example this project was
- * imported from (Silicon Labs, Zlib-licensed -- see git history for the
- * original file). That skeleton called app_proprietary_init(), which
- * created its own Micrium OS task and defined its own (empty, stub)
- * sl_rail_util_on_event() -- both now redundant and, for the callback,
- * actively conflicting: sl_subg_radio.c defines the real
- * sl_rail_util_on_event(), and aps.c creates its own dedicated dispatch
- * task via aps_init(). Wiring src/ into this project's real build (see the
- * INTEGRATION STATUS note in src/ble/app_bluetooth.c) will need
- * micriumos/app_proprietary.c's conflicting definitions removed or gutted
- * at the same time this file replaces the generated app.c -- not done yet,
- * since that's a Studio-project-side edit, not a src/ one.
+ * app_init() previously called app_proprietary_init(), which created its
+ * own Micrium OS task and defined its own (empty, stub) sl_rail_util_on_event()
+ * -- both now redundant and, for the callback, actively conflicting:
+ * sl_subg_radio.c defines the real sl_rail_util_on_event(), and aps.c
+ * creates its own dedicated dispatch task via aps_init(). See the
+ * INTEGRATION STATUS note in src/ble/app_bluetooth.c for what's still needed
+ * before this actually builds through Simplicity Studio.
  */
 
 #include "sl_main_init.h"
