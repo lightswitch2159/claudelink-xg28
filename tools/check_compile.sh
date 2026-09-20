@@ -126,5 +126,17 @@ for f in aps aps_transport; do
 	echo "OK: $f.c"
 done
 
+echo "=== BLE layer (app_bluetooth) and app entry point ==="
+# -I"$STUDIO_PROJECT" (not just "@$RSP") because app_bluetooth.c includes
+# app_bluetooth.h and gatt_db.h by their bare names from this project's own
+# top-level/autogen dirs, the same way the real generated app.c/app_bluetooth.c
+# do -- @$RSP alone (the cmake target_include_directories list) does not
+# necessarily cover the project root itself.
+BLE_INCLUDES=(-I"$REPO/src" -I"$REPO/src/aps" -I"$REPO/src/drivers/rail" -I"$REPO/src/encoding" -I"$STUDIO_PROJECT")
+"$GCC" "${CFLAGS[@]}" "${BLE_INCLUDES[@]}" "@$RSP" "$REPO/src/ble/app_bluetooth.c"
+echo "OK: app_bluetooth.c"
+"$GCC" "${CFLAGS[@]}" "${BLE_INCLUDES[@]}" "@$RSP" "$REPO/src/app.c"
+echo "OK: app.c"
+
 echo
 echo "All clean."
