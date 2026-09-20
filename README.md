@@ -12,17 +12,14 @@ firmware.
 
 ## Status
 
-**Compiles clean, not run on hardware yet** -- no board on the bench. Every
-file below passes a real `-fsyntax-only` compile against the exact
-toolchain, include paths, and preprocessor defines of the real Simplicity
-Studio project this code integrates with (`tools/check_compile.sh`, extracts
-its flags directly from that project's generated `cmake_gcc/*.cmake` rather
-than hand-maintaining a copy). Zero errors, zero warnings with
-`-Wall -Wextra`.
-
-**Not yet done**: the files under `src/` are not yet added to the Studio
-project's own `.slcp` source list, so a real Studio build does not compile
-them yet -- see "Building" below.
+**Builds and links clean into a real firmware image, not run on hardware
+yet** -- no board on the bench. `src/` is wired into the actual Simplicity
+Studio project (`orangelink_xg28`'s own `.slcp` source list) and
+`tools/build.sh` drives a full compile-and-link through that project's own
+generated CMake/Ninja workflow, entirely from the shell -- no Studio GUI
+needed. Produces a real `orangelink_xg28.{out,hex,bin}` (250 KB code, 1 KB
+data, 300 KB bss). `tools/check_compile.sh` remains for a faster
+syntax-only check of `src/` in isolation.
 
 ## Architecture
 
@@ -73,20 +70,22 @@ Data after seeing the notification.
 
 Requires the Simplicity Studio project `orangelink_xg28`
 (`~/SimplicityStudio/v6_workspace/orangelink_xg28/`), generated from Silicon
-Labs' "Bluetooth RAIL DMP - SoC Empty Micrium OS" example for BRD2705A.
+Labs' "Bluetooth RAIL DMP - SoC Empty Micrium OS" example for BRD2705A, with
+this repo's `src/aps`, `src/drivers/rail`, and `src/encoding` copied into the
+project (as `aps/`, `drivers/rail/`, `encoding/`) and added to its own
+`orangelink_xg28.slcp` `source:`/`include:` lists -- `src/app.c` and
+`src/ble/app_bluetooth.c` replace the project's generated `app.c`/
+`app_bluetooth.c` directly (already declared in the `.slcp`, no edit needed
+for those two).
 
 ```bash
-tools/check_compile.sh   # syntax-checks src/ against the real project's build flags
+tools/build.sh            # full compile + link, produces a real firmware image
+tools/check_compile.sh    # faster: syntax-checks src/ in isolation, no link
 ```
-
-To produce an actual flashable image: add `src/aps/*.c`, `src/drivers/rail/*.c`,
-`src/ble/*.c`, and `src/app.c` to the project's own source list (Studio's
-Project Configurator, not a hand-edited `.slcp`), and remove the now-empty
-`micriumos/app_proprietary.c` stub it currently overwrote.
 
 ## Not started
 
-- No hardware validation -- board hasn't arrived.
+- No hardware validation -- board hasn't arrived. Nothing has been flashed.
 - Custom Name rename is RAM-only: no flash-backed settings storage exists
   yet, so it doesn't survive a power cycle the way "persist" implies in the
   legacy protocol.
