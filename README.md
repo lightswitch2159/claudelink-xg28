@@ -7,13 +7,29 @@ preprocessor defines Simplicity Studio's own generated project uses for this
 board (`tools/check_compile.sh`, reproducible, extracts its flags directly
 from the live generated project rather than hand-maintaining a copy). Zero
 errors, zero warnings with `-Wall -Wextra`. As of this check, that project is
-`rail_bt_dmp_soc_range_test` -- a real, generated **Bluetooth + RAIL DMP**
-project for BRD2705A, not the bare RAIL-only `rail_soc_railtest` project used
-earlier -- so this now verifies the actual `sl_rail_*()` API family and
-Micrium OS integration this port needs, not just RAIL in isolation. Every
-header include resolves, every call site matches its actual declared
-signature, every constant used is real -- not just a plausible-looking
-skeleton.
+`orangelink_xg28` -- imported directly from the real
+"Bluetooth RAIL DMP - SoC Empty Micrium OS" example (`bt_rail_dmp_soc_empty`,
+package `bluetooth_le_app`), a clean minimal Bluetooth+RAIL DMP skeleton with
+none of the Range Test/CLI/LCD baggage the previous reference project
+(`rail_bt_dmp_soc_range_test`) carried. It verifies the actual `sl_rail_*()`
+API family and Micrium OS integration this port needs, not just RAIL in
+isolation, and now includes a real custom BLE GATT service (see below) on top
+of that. Every header include resolves, every call site matches its actual
+declared signature, every constant used is real -- not just a
+plausible-looking skeleton.
+
+**Project history, since it's not obvious from the file layout:** three
+Simplicity Studio projects exist on disk. `rail_soc_railtest` (bare RAIL, no
+Bluetooth/RTOS) was the original reference that got the encoding layer and
+first driver skeleton compiling, and resolved the `RAIL_*` (not `sl_rail_*`)
+API family question *for that project shape*. `rail_bt_dmp_soc_range_test`
+(a real Bluetooth+RAIL DMP example, Micrium OS) replaced it as the primary
+target once BLE work started, and is what caught the *actual* `sl_rail_*`
+family and Micrium OS RTOS this port needs. It was then itself superseded by
+`orangelink_xg28` after discovering its entire Bluetooth stack was a
+transitive dependency of its Range Test application components -- removing
+Range Test would have silently pruned Bluetooth along with it. All three
+stay on disk; only `orangelink_xg28` is live going forward.
 
 ## What this is
 
@@ -30,11 +46,13 @@ project, built and eventually generated through Simplicity Studio 6.
 
 ## What is real so far
 
-- **The radio PHY is configured in both projects now.** Originally built in
-  `rail_soc_railtest` (`RAIL - SoC RAILtest` example, bare RAIL, kept as the
-  `RAIL_*` API reference) and, this session, re-applied field-for-field to
-  `rail_bt_dmp_soc_range_test`'s own Radio Configurator -- the project the
-  driver actually integrates with. Every field checked against the working
+- **The radio PHY is configured, now in `orangelink_xg28`.** Originally built
+  in `rail_soc_railtest` (`RAIL - SoC RAILtest` example, bare RAIL, kept as
+  the `RAIL_*` API reference), re-applied field-for-field to
+  `rail_bt_dmp_soc_range_test`'s own Radio Configurator, then carried forward
+  again (by copying the verified `config/rail/radio_settings.radioconf` file
+  directly, not redone by hand) into `orangelink_xg28` when that project
+  superseded it. Every field checked against the working
   RFM69 driver's own `rf69_cfg_916[]` register table (from `orangelink-ncs`,
   `feather-nrf52832` branch) or, where this chip's physics genuinely differs
   from the RFM69's (channel acquisition bandwidth), against the
@@ -218,13 +236,56 @@ project, built and eventually generated through Simplicity Studio 6.
   and includes Micrium OS in its own `cmake_gcc/*.cmake` output, so the
   earlier script's separate FreeRTOS-header-hunting section is gone entirely.
 
+- **A custom BLE GATT service exists**, hand-authored directly into
+  `orangelink_xg28`'s `config/btconf/gatt_configuration.btconf` and confirmed
+  via the real regenerated `autogen/gatt_db.c`/`.h` after a Studio rebuild --
+  not yet wired to any application code. Reproduces the legacy RileyLink
+  "Insulin Pump Service" (IPS) GATT layout **exactly** (same service and
+  characteristic UUIDs, properties, lengths) so AndroidAPS/Loop see the same
+  surface they already know how to talk to, per
+  `orangelink-ncs:feather-nrf52832`'s `docs/gatt-service-spec.md`
+  (itself reconstructed from the shipping nRF5 SDK firmware):
+
+  | Characteristic | UUID | Properties | Length |
+  |---|---|---|---|
+  | Data | `C842E849-5028-42E2-867C-016ADADA9155` | Read, Write | ≤150, variable |
+  | Response Count | `6E6C7910-B89E-43A5-A0FE-50C5E2B81F4A` | Read, Notify | 1 |
+  | Timer Tick | `6E6C7910-B89E-43A5-78AF-50C5E2B86F7E` | Read, Notify | 1 |
+  | Custom Name | `D93B2AF0-1E28-11E4-8C21-0800200C9A66` | Read, Write | ≤30, variable |
+  | Version | `30D99DC9-7C91-4295-A051-0A104D238CF2` | Read | 13, fixed `"ble_rfspy 2.0"` |
+  | LED Mode | `C6D84241-F1A7-4F9C-A25F-FCE16732F14E` | Read, Write | 1 |
+
+  Service UUID `0235733B-99C5-4197-B856-69219C2A3845`. The `.btconf` XML was
+  authored by hand rather than through the GATT Configurator GUI (entering
+  six 128-bit UUIDs by hand in the GUI is exactly the kind of tedious,
+  error-prone work worth automating) -- validated well-formed before ever
+  touching Studio, then confirmed correct a second time by reading the real
+  compiled `gattdb_ips_*` symbols and lengths in the regenerated
+  `autogen/gatt_db.h` after Studio rebuilt from it. Device name also set to
+  `ClaudeLinkSI`, distinct from the existing nRF52832/nRF52840 boards'
+  `ClaudeLink` name (a real prior incident had two identically-named boards
+  plus an unrelated third device all advertising as `ClaudeLink` on the same
+  bench, wasting a whole session targeting the wrong one).
+
+  **Not yet done:** no application code reads from or writes to any of
+  these characteristics. `aps_put_cmd()` needs to be called from a GATT
+  write event on Data, and `aps_transport_send()` needs a real
+  implementation -- store the response as the Data value, then increment and
+  notify Response Count, in that order (the ordering is load-bearing: the
+  legacy client reads Data only after seeing the Response Count
+  notification).
+
 ## What is not started
 
-- BLE side entirely -- no work yet on Silicon Labs' native Bluetooth stack
-  or the Dynamic Multiprotocol coexistence structure. `aps_transport_send()`
-  has no real implementation to hand responses to yet.
+- **The BLE↔APS wiring itself** -- `app_bluetooth.c` (a new file, following
+  the pattern in `orangelink_xg28`'s own generated `app_bluetooth.c`
+  skeleton) needs to handle `sl_bt_evt_gatt_server_attribute_value_id` for
+  the Data characteristic (calling `aps_put_cmd()`) and implement
+  `aps_transport_send()` as the Data-write/Response-Count-notify handshake
+  described above. This is the actual remaining gap between "GATT service
+  exists" and "a BLE client can talk to this firmware."
 - **`APS_TASK_PRIORITY` needs tuning** against this project's real Bluetooth
-  task priorities (see above) -- not yet read from the generated project.
+  task priorities -- not yet read from the generated project.
 - Nothing has run on real hardware. The board has not arrived yet.
 
 ## Provenance
@@ -236,13 +297,16 @@ memory:
 - header/source files fetched into `orangelink-ncs-ws/modules/hal/silabs`
   this session (pinned to Zephyr's own `hal_silabs` revision,
   `f5201210afa1319ed8dd8dbe21682bcb63b25771`), or
-- Simplicity Studio's own generated projects, live on this machine:
+- Simplicity Studio's own generated projects, live on this machine, all
+  built against SDK Suite 2026.6.1:
   `~/SimplicityStudio/v6_workspace/rail_soc_railtest/` (bare RAIL, no
-  Bluetooth/RTOS -- the original driver-skeleton/encoding-layer reference)
-  and `~/SimplicityStudio/v6_workspace/rail_bt_dmp_soc_range_test/` (real
-  Bluetooth+RAIL DMP, Micrium OS -- generated this session, now the primary
-  reference for the driver and protocol layer), both built against SDK Suite
-  2026.6.1.
+  Bluetooth/RTOS -- the original driver-skeleton/encoding-layer reference),
+  `~/SimplicityStudio/v6_workspace/rail_bt_dmp_soc_range_test/` (real
+  Bluetooth+RAIL DMP, Micrium OS -- caught the actual `sl_rail_*`/Micrium OS
+  requirements, later superseded), and
+  `~/SimplicityStudio/v6_workspace/orangelink_xg28/` (imported from the
+  clean `bt_rail_dmp_soc_empty` Micrium OS example, no Range Test
+  entanglement -- the current primary reference).
 
 The second kind of source is what caught every correction on record here:
 the `RAIL_*`/`sl_rail_*` mistake (header comments alone said the wrong thing,

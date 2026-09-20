@@ -9,22 +9,33 @@
 # own generated cmake_gcc/<project>.cmake, not hand-maintained here, so it
 # stays correct as Studio regenerates the project.
 #
-# Default project: rail_bt_dmp_soc_range_test ("RAIL Bluetooth DMP - SoC
-# Range Test"), the real Bluetooth+RAIL DMP example generated for BRD2705A --
-# NOT rail_soc_railtest (a bare RAIL-only project, no Bluetooth/RTOS, used
-# earlier for the encoding-layer/first-driver-skeleton checks and kept as the
-# reference that resolved the RAIL_*-vs-sl_rail_* question the OTHER way for
-# that project shape; see sl_subg_radio.c's file banner for the full trail).
-# This project pulls in Micrium OS (device_series_2 in its own .slcp), not
-# FreeRTOS -- an earlier version of this script carried a whole separate
-# section hunting down FreeRTOS headers and borrowing rail_soc_railtest's
-# include set as a workaround; that's gone now that a real DMP project with
-# its own RTOS in its own generated cmake_gcc/*.cmake exists on disk.
+# Default project: orangelink_xg28, imported from the real
+# "Bluetooth RAIL DMP - SoC Empty Micrium OS" example (bt_rail_dmp_soc_empty,
+# package bluetooth_le_app) -- a clean, minimal Bluetooth+RAIL DMP skeleton
+# with no Range Test/CLI/LCD/packet-assistant baggage. This replaced
+# rail_bt_dmp_soc_range_test as the primary target: that project's entire
+# Bluetooth stack turned out to be a transitive dependency of its Range Test
+# app components (sl_rail_sdk_range_test_dmp_component and friends), so
+# stripping Range Test out of it would have also silently pruned Bluetooth as
+# an orphaned dependency. orangelink_xg28 never had that entanglement -- its
+# own .slcp declares bluetooth_stack/gatt_configuration/bluetooth_feature_*
+# directly. Notably, this exact example did not surface in Simplicity
+# Studio's example-project catalog once a board/part was selected (a real
+# Studio catalog bug, not a hardware incompatibility -- the target die has
+# 256 KB SRAM, comfortably over the example's declared 64k RAM hwfilter), so
+# it was created via File > Import pointed directly at its .slcp path rather
+# than the catalog browser.
+#
+# rail_soc_railtest (bare RAIL-only, no Bluetooth/RTOS) and
+# rail_bt_dmp_soc_range_test (superseded, see above) are both kept around on
+# disk as historical references -- rail_soc_railtest specifically resolved
+# the RAIL_*-vs-sl_rail_* question the OTHER way for that project shape; see
+# sl_subg_radio.c's file banner for the full trail across all of this.
 #
 # SPDX-License-Identifier: GPL-2.0-only
 set -euo pipefail
 
-STUDIO_PROJECT="${1:-$HOME/SimplicityStudio/v6_workspace/rail_bt_dmp_soc_range_test}"
+STUDIO_PROJECT="${1:-$HOME/SimplicityStudio/v6_workspace/orangelink_xg28}"
 PROJECT_NAME="$(basename "$STUDIO_PROJECT")"
 CMAKE_FILE="$STUDIO_PROJECT/cmake_gcc/${PROJECT_NAME}.cmake"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
