@@ -87,10 +87,9 @@ Project Configurator, not a hand-edited `.slcp`), and remove the now-empty
 ## Not started
 
 - No hardware validation -- board hasn't arrived.
-- Custom Name characteristic write has no handler (no-op; legacy behaviour
-  for LED Mode, not for this one).
-- `APS_TASK_PRIORITY` (in `aps.c`) is a placeholder, not tuned against the
-  Bluetooth stack's real task priorities.
+- Custom Name rename is RAM-only: no flash-backed settings storage exists
+  yet, so it doesn't survive a power cycle the way "persist" implies in the
+  legacy protocol.
 - TX power control (`sl_subg_set_power_level`) and frequency retuning
   (`sl_subg_set_freq`) are implemented but not hardware-verified.
 

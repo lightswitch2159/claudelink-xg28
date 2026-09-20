@@ -704,24 +704,17 @@ static void aps_dispatch(const struct aps_req *req)
  * Zephyr stack.
  */
 #define APS_TASK_STACK_SIZE_ELEMS 512
-#define APS_TASK_PRIORITY 10   /* TODO: not yet verified against this
-				 * project's real Bluetooth task priorities --
-				 * must end up below (i.e. numerically GREATER
-				 * than, in Micrium OS's convention where 0 is
-				 * highest priority -- confirmed from os.h:
-				 * OS_PRIO_INIT is defined as OS_CFG_PRIO_MAX,
-				 * the "unassigned" sentinel, implying the
-				 * numeric max is the least urgent end of the
-				 * range) whatever priority the generated
-				 * Bluetooth stack task(s) run at, mirroring the
-				 * source's "priority below the Bluetooth RX
-				 * thread" requirement (APS_THREAD_PRIORITY).
-				 * This project's own task priorities were not
-				 * read this session -- same discipline as the
-				 * RAIL_* vs sl_rail_* question, needs checking
-				 * against real generated/configured values
-				 * before this number means anything.
-				 */
+/*
+ * 53: numerically just below (i.e. lower-urgency than, per Micrium OS's
+ * 0-is-highest convention) all three real Bluetooth stack task priorities in
+ * this project's own config/sl_bt_rtos_config_s2.h --
+ * SL_BT_RTOS_EVENT_HANDLER_TASK_PRIORITY (50), SL_BT_RTOS_HOST_STACK_TASK_PRIORITY
+ * (51), SL_BT_RTOS_LINK_LAYER_TASK_PRIORITY (52) -- so this task never
+ * preempts any of them, mirroring the source's "priority below the
+ * Bluetooth RX thread" requirement (APS_THREAD_PRIORITY). OS_CFG_PRIO_MAX is
+ * 64 in this project's config/os_cfg.h, so 53 is comfortably in range.
+ */
+#define APS_TASK_PRIORITY 53
 #define APS_QUEUE_DEPTH 4
 
 static CPU_STK s_aps_task_stack[APS_TASK_STACK_SIZE_ELEMS];

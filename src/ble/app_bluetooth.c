@@ -153,13 +153,12 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
 		start_advertising();
 		break;
 
-	/* A remote GATT client wrote a local attribute -- the only write we
-	 * act on is the IPS Data characteristic, which carries APS command
-	 * frames. Writes to Custom Name/LED Mode are accepted by the GATT
-	 * server automatically (Write property, no application handler
-	 * required to ack them) but have no behaviour wired up here yet --
-	 * matches the legacy LED Mode handler being empty, but Custom Name
-	 * SHOULD eventually persist and change the advertised name; not done.
+	/* A remote GATT client wrote a local attribute. The IPS Data
+	 * characteristic carries APS command frames; Custom Name renames the
+	 * device. LED Mode is accepted by the GATT server automatically
+	 * (Write property, no application handler required to ack it) and
+	 * deliberately does nothing -- matches the legacy firmware's own
+	 * empty LED Mode handler.
 	 */
 	case sl_bt_evt_gatt_server_attribute_value_id: {
 		const sl_bt_evt_gatt_server_attribute_value_t *v =
@@ -177,6 +176,52 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
 			(void)sl_bt_connection_get_median_rssi(v->connection, &rssi);
 
 			aps_put_cmd(v->value.data, v->value.len, rssi);
+		} else if (v->attribute == gattdb_ips_custom_name) {
+			/*
+			 * Legacy behaviour (RFM69 reference repo's ips.h:
+			 * IPS_EVT_CUS_NAME_RX -> "persist + disconnect") --
+			 * reproduced here as far as this project's current
+			 * infrastructure allows: no flash-backed settings
+			 * storage exists yet, so this changes the advertised
+			 * name for the remainder of this power cycle only,
+			 * not across a reboot. "Persist" in the fullest sense
+			 * needs NVM3 (or similar) wired up first; not done.
+			 *
+			 * The Bluetooth stack's own "full local name" in
+			 * advertising data (see sl_bt_legacy_advertiser_
+			 * generate_data()'s doc comment) is sourced from the
+			 * standard Device Name characteristic (0x2A00), not
+			 * from Custom Name directly -- there is no separate
+			 * "set advertised name" command in this SDK, this is
+			 * the sanctioned mechanism. Device Name is declared
+			 * FIXED length (gattdb_device_name_len, currently 12
+			 * -- see config/btconf/gatt_configuration.btconf),
+			 * narrower than Custom Name's own 30-byte capacity,
+			 * so a longer name is truncated here rather than
+			 * risking a rejected write against a fixed-length
+			 * attribute of the wrong size.
+			 *
+			 * Deliberately does NOT call start_advertising() here:
+			 * this connection is about to close, and the
+			 * connection_closed_id case above already regenerates
+			 * advertising data (re-reading the just-updated Device
+			 * Name) and restarts advertising when that happens.
+			 * Calling it here too would try to start an
+			 * already-active advertising set a second time.
+			 */
+			uint16_t name_len = v->value.len;
+			sl_status_t name_sc;
+
+			if (name_len > gattdb_device_name_len) {
+				name_len = gattdb_device_name_len;
+			}
+
+			name_sc = sl_bt_gatt_server_write_attribute_value(
+				gattdb_device_name, 0, name_len, v->value.data);
+			if (name_sc == SL_STATUS_OK &&
+			    v->connection != SL_BT_INVALID_CONNECTION_HANDLE) {
+				(void)sl_bt_connection_close(v->connection);
+			}
 		}
 		break;
 	}
