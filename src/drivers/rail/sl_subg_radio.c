@@ -205,12 +205,28 @@ int sl_subg_radio_init(void)
 	sl_rail_status_t st;
 
 	/*
-	 * Bring RAIL up via Silicon Labs' own generated bring-up, not a hand
-	 * rolled sl_rail_init()/sl_rail_config_channels() pair -- it is already
-	 * wired to the real channel config and to calibration/PA setup this
-	 * driver has no reason to reimplement.
+	 * Do NOT call sl_rail_util_init() here -- REAL HARDWARE BUG FOUND AND
+	 * FIXED THIS SESSION, not a guess. Silicon Labs' generated
+	 * autogen/sl_event_handler.c already calls it once, automatically, from
+	 * sl_stack_init(), which the framework runs before app_init() (and
+	 * therefore before sl_subg_radio_init(), which app.c calls from
+	 * app_init()) on every boot. Calling it a second time here re-ran
+	 * sl_rail_init() against an already-initialized RAIL instance, which
+	 * returned SL_STATUS_INVALID_PARAMETER (0x0021) -- confirmed on real
+	 * hardware via RTT-connected printf checkpoints (see git history for the
+	 * diagnostic session) -- and that failure trips the generated
+	 * sl_rail_util_init_inst0()'s own APP_ASSERT(), which hangs forever
+	 * (silently: this project has no app_log component, so app_assert's
+	 * failure path is the printless infinite-loop variant -- see
+	 * app_assert.h). That hang, before anything RAIL- or BLE-related ever
+	 * ran, was the very first symptom this bug produced: total silence, no
+	 * BLE advertisement, nothing.
+	 *
+	 * Just retrieve the handle the framework already brought up -- the same
+	 * pattern already used (in a comment, not compiled) in the
+	 * bt_rail_dmp_soc_empty example's own app_proprietary.c: get the handle,
+	 * do not re-init.
 	 */
-	sl_rail_util_init();
 	s_rail_handle = sl_rail_util_get_handle(SL_RAIL_UTIL_HANDLE_INST0);
 	if (s_rail_handle == SL_RAIL_EFR32_HANDLE) {
 		return -1;

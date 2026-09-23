@@ -11,6 +11,8 @@
  * before this actually builds through Simplicity Studio.
  */
 
+#include <stdio.h>
+
 #include "sl_main_init.h"
 
 #include "aps.h"
@@ -18,6 +20,8 @@
 
 void app_init(void)
 {
+	int radio_rc;
+
 	/* Order matters only in that aps_init() does not itself call
 	 * sl_subg_radio_init() -- see aps.c's own comment on that -- so it
 	 * must happen here, once, before anything can reach the radio
@@ -25,6 +29,16 @@ void app_init(void)
 	 * BLE having booted yet; sl_bt_on_event()'s boot case runs
 	 * independently.
 	 */
-	(void)sl_subg_radio_init();
+	radio_rc = sl_subg_radio_init();
+	/* Bare printf() over the RTT console -- src/aps/aps.c's own APS_LOG_*
+	 * macros are still no-ops (see item 5 in its file banner), so this is
+	 * the only boot-path visibility that exists right now. Worth keeping
+	 * permanently: a failed radio init here would otherwise be as silent as
+	 * the real bug this same printf caught on first hardware bring-up (see
+	 * git history) -- sl_subg_radio_init() returning nonzero deserves to be
+	 * visible, not just checked and dropped.
+	 */
+	printf("app_init: sl_subg_radio_init() = %d\r\n", radio_rc);
+
 	aps_init();
 }

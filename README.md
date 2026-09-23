@@ -12,14 +12,57 @@ firmware.
 
 ## Status
 
-**Builds and links clean into a real firmware image, not run on hardware
-yet** -- no board on the bench. `src/` is wired into the actual Simplicity
-Studio project (`orangelink_xg28`'s own `.slcp` source list) and
-`tools/build.sh` drives a full compile-and-link through that project's own
-generated CMake/Ninja workflow, entirely from the shell -- no Studio GUI
-needed. Produces a real `orangelink_xg28.{out,hex,bin}` (250 KB code, 1 KB
-data, 300 KB bss). `tools/check_compile.sh` remains for a faster
+**Running on real hardware.** Flashed to a BRD2705A (xG28-EK2705A Explorer
+Kit) via Simplicity Commander, boots, brings up the sub-GHz radio, advertises
+over BLE as `ClaudeLinkSI`, accepts a connection, and exposes the real GATT
+service (confirmed via `bluetoothctl`: `UUID: Vendor specific
+(0235733b-99c5-4197-b856-69219c2a3845)`, the Insulin Pump Service). Nothing
+has talked to an actual pump yet -- that's the next real milestone.
+
+`src/` is wired into the actual Simplicity Studio project (`orangelink_xg28`'s
+own `.slcp` source list) and `tools/build.sh` drives a full compile-and-link
+through that project's own generated CMake/Ninja workflow, entirely from the
+shell -- no Studio GUI needed. `tools/check_compile.sh` remains for a faster
 syntax-only check of `src/` in isolation.
+
+**A real bug was caught and fixed getting here**, worth keeping on record: on
+first flash, the board hung completely silently -- no BLE advertisement, no
+output, nothing. Bringing up RTT-based `printf()` logging (see "Diagnostic
+logging" below) traced it to `sl_subg_radio_init()` calling
+`sl_rail_util_init()`, which Silicon Labs' generated boot sequence
+(`autogen/sl_event_handler.c`'s `sl_stack_init()`) already calls once,
+automatically, before `app_init()` ever runs. The second call re-ran
+`sl_rail_init()` against an already-initialized RAIL instance, which returned
+`SL_STATUS_INVALID_PARAMETER` -- and since this project has no `app_log`
+component, the resulting `app_assert()` failure path is a silent infinite
+loop, not a printed error. Fixed in `sl_subg_radio.c`: just retrieve the
+handle the framework already brought up, don't re-initialize it.
+
+## Diagnostic logging
+
+This project shipped with zero logging infrastructure. Added real RTT-based
+`printf()` (SEGGER RTT over the debug probe -- no UART pins, no board-level
+wiring) directly to the Simplicity Studio project, since it's what actually
+caught the bug above:
+
+- Components added to `orangelink_xg28.slcp`: `segger_rtt`, `iostream_rtt`,
+  `printf`, `iostream_retarget_stdio`, `iostream_stdlib_config`, `iostream`,
+  `cmsis_os2_ext_task_register`.
+- Source copied from the SDK into the project (`segger/`, plus the relevant
+  `platform_core/platform/service/iostream/*` and `printf/*` files) and wired
+  into `cmake_gcc/orangelink_xg28.cmake` by hand, since no command-line SLC
+  tool is available on this machine to regenerate the project from the
+  `.slcp` outside Studio's own GUI (same caveat as the `src/` wiring below).
+- `autogen/sl_event_handler.c` and two new `autogen/sl_iostream_*` files
+  hand-adapted from a real generated reference (a sibling project using
+  EUSART/VCOM instead of RTT) to wire the RTT instance into the boot
+  sequence.
+
+Read it with `commander rtt connect -d EFR32ZG28B312F1024IM48` while the
+board is connected. `app.c` already has one permanent checkpoint (the radio
+init result); `src/aps/aps.c`'s own `APS_LOG_*` macros are still no-ops (see
+item 5 in its file banner) and would be the natural next thing to wire to
+this now that a real backend exists -- not done yet.
 
 ## Architecture
 
@@ -83,14 +126,30 @@ tools/build.sh            # full compile + link, produces a real firmware image
 tools/check_compile.sh    # faster: syntax-checks src/ in isolation, no link
 ```
 
+To flash a connected board, using Simplicity Commander:
+
+```bash
+commander flash cmake_gcc/build/base/orangelink_xg28.hex -d EFR32ZG28B312F1024IM48
+```
+
+(run from the Studio project's `cmake_gcc/` directory). First-time setup on
+Linux needs Commander's udev rule installed (`sudo cp 99-jlink.rules
+/etc/udev/rules.d/ && sudo udevadm control --reload-rules && sudo udevadm
+trigger`, then replug the board) before it can see the on-board J-Link debug
+probe.
+
 ## Not started
 
-- No hardware validation -- board hasn't arrived. Nothing has been flashed.
+- Nothing has talked to an actual pump. The bridge advertises, connects, and
+  exposes the right GATT service on real hardware, but no APS command has
+  been exercised against a Minimed pump yet.
 - Custom Name rename is RAM-only: no flash-backed settings storage exists
   yet, so it doesn't survive a power cycle the way "persist" implies in the
   legacy protocol.
 - TX power control (`sl_subg_set_power_level`) and frequency retuning
   (`sl_subg_set_freq`) are implemented but not hardware-verified.
+- `src/aps/aps.c`'s `APS_LOG_*` macros are still no-ops -- see "Diagnostic
+  logging" above.
 
 ## License
 
