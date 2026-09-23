@@ -53,6 +53,8 @@
  * validation errors, than to hand-edit it blind.
  */
 
+#include <string.h>
+
 #include "app_assert.h"
 #include "sl_bluetooth.h"
 #include "app_bluetooth.h"
@@ -85,12 +87,63 @@ static uint8_t active_connection = SL_BT_INVALID_CONNECTION_HANDLE;
  */
 static uint8_t response_count;
 
+/*
+ * Explicit advertising/scan-response data, not
+ * sl_bt_legacy_advertiser_generate_data()'s automatic packing.
+ *
+ * AndroidAPS's BLE device scan filters on the advertised Insulin Pump
+ * Service UUID -- confirmed against this project's own RFM69 reference
+ * firmware (main.c), which puts that same 128-bit UUID in the primary
+ * advertising packet for exactly that reason ("AAPS matches on it").
+ * config/btconf/gatt_configuration.btconf marks that service
+ * advertise="false", and nothing in the generated autogen/gatt_db.c
+ * represents that flag in a form reachable from here, so rather than guess
+ * how the closed-source stack's automatic packer treats it, the packet is
+ * built explicitly to match the known-working reference byte-for-byte:
+ * Flags + complete 128-bit Service UUID list in the advertising packet
+ * (21 B), Complete Local Name in the scan response -- a 128-bit UUID and a
+ * name don't both fit in the legacy 31-byte advertising packet.
+ */
 static void start_advertising(void)
 {
+	static const uint8_t adv_data[] = {
+		0x02, 0x01, 0x06, /* Flags: LE General Discoverable, BR/EDR not supported */
+		0x11, 0x07,       /* length 17, Complete List of 128-bit Service UUIDs */
+		/* Insulin Pump Service 0235733b-99c5-4197-b856-69219c2a3845,
+		 * little-endian on the wire -- matches gattdb_uuidtable_128_map's
+		 * own encoding of the same UUID in autogen/gatt_db.c.
+		 */
+		0x45, 0x38, 0x2a, 0x9c, 0x21, 0x69, 0x56, 0xb8,
+		0x97, 0x41, 0xc5, 0x99, 0x3b, 0x73, 0x35, 0x02,
+	};
+	uint8_t scan_rsp[2 + gattdb_device_name_len];
+	uint8_t name[gattdb_device_name_len];
+	size_t name_len = 0;
 	sl_status_t sc;
 
-	sc = sl_bt_legacy_advertiser_generate_data(advertising_set_handle,
-						   sl_bt_advertiser_general_discoverable);
+	/* Read rather than hardcode: a Custom Name rename (see the
+	 * gattdb_ips_custom_name case below) writes gattdb_device_name, and
+	 * this function runs again on every reconnect (connection_closed_id),
+	 * so the advertised name follows the rename from the next
+	 * advertisement onward, matching this function's pre-existing
+	 * contract.
+	 */
+	sc = sl_bt_gatt_server_read_attribute_value(gattdb_device_name, 0,
+						    sizeof(name), &name_len, name);
+	app_assert_status(sc);
+
+	scan_rsp[0] = (uint8_t)(1 + name_len); /* AD type + name bytes */
+	scan_rsp[1] = 0x09; /* Complete Local Name */
+	memcpy(&scan_rsp[2], name, name_len);
+
+	sc = sl_bt_legacy_advertiser_set_data(advertising_set_handle,
+					      sl_bt_advertiser_advertising_data_packet,
+					      sizeof(adv_data), adv_data);
+	app_assert_status(sc);
+
+	sc = sl_bt_legacy_advertiser_set_data(advertising_set_handle,
+					      sl_bt_advertiser_scan_response_packet,
+					      2 + name_len, scan_rsp);
 	app_assert_status(sc);
 
 	sc = sl_bt_legacy_advertiser_start(advertising_set_handle,

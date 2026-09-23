@@ -14,8 +14,10 @@ firmware.
 
 **Running on real hardware.** Flashed to a BRD2705A (xG28-EK2705A Explorer
 Kit) via Simplicity Commander, boots, brings up the sub-GHz radio, advertises
-over BLE as `ClaudeLinkSI`, accepts a connection, and exposes the real GATT
-service (confirmed via `bluetoothctl`: `UUID: Vendor specific
+over BLE as `ClaudeLinkSI` with the Insulin Pump Service UUID in the
+advertisement itself (not just discoverable after connecting -- see "AAPS
+couldn't see the device" below), accepts a connection, and exposes the real
+GATT service (confirmed via `bluetoothctl`: `UUID: Vendor specific
 (0235733b-99c5-4197-b856-69219c2a3845)`, the Insulin Pump Service). Nothing
 has talked to an actual pump yet -- that's the next real milestone.
 
@@ -38,6 +40,28 @@ component, the resulting `app_assert()` failure path is a silent infinite
 loop, not a printed error. Fixed in `sl_subg_radio.c`: just retrieve the
 handle the framework already brought up, don't re-initialize it.
 
+**AAPS couldn't see the device, even though `bluetoothctl` could.** The
+board advertised and connected fine, and generic scanners (`bluetoothctl`,
+nRF Connect) listed it by name -- but it never appeared in AndroidAPS's own
+RileyLink device picker. AAPS's BLE scan filters on the advertised Insulin
+Pump Service UUID (confirmed against this project's own RFM69 reference
+firmware, which puts that same 128-bit UUID in the primary advertising
+packet for exactly that reason), and this project's GATT Configurator had
+the Insulin Pump Service marked `advertise="false"` -- inherited from
+however the service was first created, never noticed because every scanner
+used to verify hardware bring-up looks at the device by name/all-devices,
+not by a service-UUID filter the way AAPS does. Fixed in
+`app_bluetooth.c`'s `start_advertising()`: replaced the SDK's automatic
+`sl_bt_legacy_advertiser_generate_data()` (whose "advertise" checkbox
+behavior isn't represented anywhere in the generated `gatt_db.c` this
+project's code can target) with an explicit advertising packet -- Flags +
+the complete 128-bit Service UUID list -- and a scan response built from
+the live Device Name characteristic (so a Custom Name rename still takes
+effect on the next reconnect, as before). Verified against a from-scratch
+`bluetoothctl` scan after fully removing the device from the host's BlueZ
+cache: the Service UUID and correct advertising flags (`06`) appear before
+any connection is made.
+
 ## Diagnostic logging
 
 This project shipped with zero logging infrastructure. Added real RTT-based
@@ -59,10 +83,10 @@ caught the bug above:
   sequence.
 
 Read it with `commander rtt connect -d EFR32ZG28B312F1024IM48` while the
-board is connected. `app.c` already has one permanent checkpoint (the radio
-init result); `src/aps/aps.c`'s own `APS_LOG_*` macros are still no-ops (see
-item 5 in its file banner) and would be the natural next thing to wire to
-this now that a real backend exists -- not done yet.
+board is connected. `app.c` has one permanent checkpoint (the radio init
+result), and `src/aps/aps.c`'s own `APS_LOG_*` macros are wired to this same
+backend -- every command dispatch, frequency tune, and send/listen outcome
+is now visible over RTT, not just the boot-time radio check.
 
 ## Architecture
 
@@ -148,8 +172,6 @@ probe.
   legacy protocol.
 - TX power control (`sl_subg_set_power_level`) and frequency retuning
   (`sl_subg_set_freq`) are implemented but not hardware-verified.
-- `src/aps/aps.c`'s `APS_LOG_*` macros are still no-ops -- see "Diagnostic
-  logging" above.
 
 ## License
 
