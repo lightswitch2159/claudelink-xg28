@@ -60,6 +60,7 @@
  * reasoning is RFM69-specific.
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include "aps.h"
@@ -101,15 +102,31 @@ static inline void aps_put_be32(uint32_t v, uint8_t *p)
 	p[3] = (uint8_t)v;
 }
 
-/* No logging backend wired up yet (see item 5) -- these are no-ops so the
- * ported call sites below don't need editing again once one exists; swap the
- * bodies for the real thing (RTT, UART, whatever this project ends up using).
+/* Wired to the real RTT-backed printf() this session (see
+ * src/drivers/rail/sl_subg_radio.c and src/app.c's git history for how that
+ * backend got added and why: it's what caught the sl_rail_util_init()
+ * double-init bug on first hardware bring-up). ##__VA_ARGS__ is a GNU
+ * extension (drops the trailing comma when no varargs are given) -- fine
+ * here, this project only ever builds with the GCC toolchain
+ * (tools/build.sh, cmake_gcc/). Every call site below already carries a real,
+ * useful message (frequency tuning results, command parse failures,
+ * send-and-listen outcomes) -- these were written the first time as if a
+ * backend existed, so wiring one up needed no changes at the call sites.
  */
-#define APS_LOG_INF(...) ((void)0)
-#define APS_LOG_WRN(...) ((void)0)
-#define APS_LOG_ERR(...) ((void)0)
-#define APS_LOG_DBG(...) ((void)0)
-#define APS_LOG_HEXDUMP_INF(...) ((void)0)
+#define APS_LOG_INF(fmt, ...) printf("[aps] " fmt "\r\n", ##__VA_ARGS__)
+#define APS_LOG_WRN(fmt, ...) printf("[aps] WARN: " fmt "\r\n", ##__VA_ARGS__)
+#define APS_LOG_ERR(fmt, ...) printf("[aps] ERROR: " fmt "\r\n", ##__VA_ARGS__)
+#define APS_LOG_DBG(fmt, ...) printf("[aps] " fmt "\r\n", ##__VA_ARGS__)
+#define APS_LOG_HEXDUMP_INF(data, len, label) aps_log_hexdump(data, len, label)
+
+static void aps_log_hexdump(const uint8_t *data, uint16_t len, const char *label)
+{
+	printf("[aps] %s (%u B):", label, len);
+	for (uint16_t i = 0; i < len; i++) {
+		printf(" %02x", data[i]);
+	}
+	printf("\r\n");
+}
 
 /* ------------------------------------------------------------------------- *
  * Protocol constants
@@ -275,7 +292,7 @@ static void apply_pending_freq(void)
 		 * but note this build only carries the 916 MHz radio, so a host
 		 * asking for 433 or 868 gets silently ignored rather than retuned.
 		 */
-		APS_LOG_WRN("frequency %u Hz outside the 916 MHz band, ignored", hz);
+		APS_LOG_WRN("frequency %u Hz outside the 916 MHz band, ignored", (unsigned)hz);
 		return;
 	}
 
@@ -299,9 +316,9 @@ static void apply_pending_freq(void)
 
 		if (err_hz > 5000 || err_hz < -5000) {
 			APS_LOG_ERR("tune FAILED: asked %u Hz, radio reads %u Hz (%+d)",
-				    hz, actual, err_hz);
+				    (unsigned)hz, (unsigned)actual, (int)err_hz);
 		} else {
-			APS_LOG_INF("tuned to %u Hz (radio reads %u)", hz, actual);
+			APS_LOG_INF("tuned to %u Hz (radio reads %u)", (unsigned)hz, (unsigned)actual);
 		}
 	}
 }
@@ -607,7 +624,7 @@ static void cmd_send_and_listen(const uint8_t *p, uint16_t len)
 	}
 
 	APS_LOG_INF("send+listen: %u B payload -> %u B encoded, listen %u ms, retries %u",
-		    payload_len, enc_len, timeout, retry_cnt);
+		    (unsigned)payload_len, (unsigned)enc_len, (unsigned)timeout, (unsigned)retry_cnt);
 
 	sl_subg_send_pkt(enc, (uint8_t)enc_len, repeat_cnt, repeat_intvl);
 	st = sl_subg_get_pkt(raw, &raw_len, timeout);
