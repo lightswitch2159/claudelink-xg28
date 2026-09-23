@@ -24,6 +24,7 @@
  * the way the RAIL_* / FreeRTOS version was against rail_soc_railtest.
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include "sl_subg_radio.h"
@@ -275,12 +276,34 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
 	RTOS_ERR err;
 
 	for (uint8_t i = 0; i <= repeat_cnt; i++) {
+		uint16_t fifo_written;
+		sl_rail_status_t tx_sc;
+
 		s_tx_done = false;
 		err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
 		(void)OSFlagPost(&s_event_flags, SL_SUBG_EVT_TX_DONE, OS_OPT_POST_FLAG_CLR, &err);
 
-		(void)sl_rail_write_tx_fifo(s_rail_handle, data, len, true);
-		(void)sl_rail_start_tx(s_rail_handle, s_channel, SL_RAIL_TX_OPTIONS_DEFAULT, NULL);
+		/* Both return values were previously discarded -- a TX that
+		 * never left the radio (bad channel/FIFO state, scheduler
+		 * refusal, etc.) looked externally identical to "sent fine,
+		 * pump just didn't answer": sl_subg_get_pkt() below times out
+		 * either way, no error, nothing to tell them apart. Checked
+		 * for real (not guessed) while investigating a live pump test
+		 * where AndroidAPS got no reply at all.
+		 */
+		fifo_written = sl_rail_write_tx_fifo(s_rail_handle, data, len, true);
+		tx_sc = sl_rail_start_tx(s_rail_handle, s_channel, SL_RAIL_TX_OPTIONS_DEFAULT, NULL);
+
+		if (i == 0 && (fifo_written != len || tx_sc != SL_RAIL_STATUS_NO_ERROR)) {
+			/* Permanent checkpoint, not temporary -- see the comment
+			 * above. First repeat only: repeat_cnt can be 200+ (a
+			 * real AndroidAPS wakeup burst), and a genuine failure
+			 * here is systemic, not a one-off worth repeating 200
+			 * times over RTT.
+			 */
+			printf("radio: TX FAILED (fifo %u/%u B written, start_tx status 0x%04lx)\r\n",
+			       fifo_written, len, (unsigned long)tx_sc);
+		}
 
 		/* Bounded, not indefinite -- unlike sl_subg_get_pkt()'s
 		 * caller-supplied listen window, a TX that never completes has no
@@ -295,6 +318,10 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
 				 ms_to_ticks(SL_SUBG_TX_DONE_TIMEOUT_MS),
 				 OS_OPT_PEND_FLAG_SET_ANY | OS_OPT_PEND_FLAG_CONSUME | OS_OPT_PEND_BLOCKING,
 				 NULL, &err);
+
+		if (i == 0 && !s_tx_done) {
+			printf("radio: TX_PACKET_SENT never arrived (timeout waiting for it)\r\n");
+		}
 
 		if (repeat_interval_ms && i < repeat_cnt) {
 			err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);

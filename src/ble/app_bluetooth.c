@@ -53,6 +53,7 @@
  * validation errors, than to hand-edit it blind.
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include "app_assert.h"
@@ -192,6 +193,13 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
 		active_connection = evt->data.evt_connection_opened.connection;
 		response_count = 0;
 		aps_set_active(true);
+		/* Permanent checkpoint, same reasoning as app.c's radio_rc
+		 * print: the BLE connection lifecycle had zero visibility
+		 * until now, and "AAPS shows problem connecting" needs this
+		 * to tell apart a BLE-level failure from a failure further
+		 * down (radio reaching the actual pump).
+		 */
+		printf("ble: connection opened (handle %u)\r\n", active_connection);
 		break;
 
 	/* The client disconnected. aps_set_active(false) aborts any
@@ -201,6 +209,9 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
 	 * the client's own timeout, and there is no longer anyone to answer.
 	 */
 	case sl_bt_evt_connection_closed_id:
+		printf("ble: connection closed (handle %u, reason 0x%04x)\r\n",
+		       evt->data.evt_connection_closed.connection,
+		       evt->data.evt_connection_closed.reason);
 		aps_set_active(false);
 		active_connection = SL_BT_INVALID_CONNECTION_HANDLE;
 		start_advertising();
@@ -218,7 +229,61 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
 			&evt->data.evt_gatt_server_attribute_value;
 
 		if (v->attribute == gattdb_ips_data) {
+			/*
+			 * Confirmed against a real AndroidAPS log (RFSpy.
+			 * writeToDataRaw, a CMD_SEND_AND_LISTEN frame: 14 05 00
+			 * 00 00 00 00 00 00 04 E2 00 00 00 A7 56 07 93 8D 00 93,
+			 * 21 B), cross-checked against RTT output from this
+			 * firmware at the same moment: the Android BLE stack's
+			 * writeCharacteristic() completed in one app-level call
+			 * (21 B > the 20 B a single ATT write fits at the
+			 * default 23 B MTU), but split it into a GATT long write
+			 * -- a Prepare Write of the first 18 B followed by an
+			 * Execute Write carrying the last 3 -- and delivered
+			 * each to this handler as its own attribute_value_id
+			 * event. The code this replaces ignored att_opcode and
+			 * offset and dispatched v->value on every event, so
+			 * aps_put_cmd() saw two independent, truncated
+			 * fragments, both failed aps.c's self-consistency check
+			 * ("malformed frame"), and AndroidAPS got no response to
+			 * a real pump command -- "no response from RileyLink" in
+			 * its own log, after 3 retries.
+			 *
+			 * gattdb_ips_data is automatic (non-"user") storage (see
+			 * config/btconf/gatt_configuration.btconf), so the stack
+			 * already reassembles queued Prepare Write chunks into
+			 * the attribute's own backing buffer -- there is nothing
+			 * to buffer here, only a dispatch to defer until the
+			 * write is actually complete.
+			 */
 			int8_t rssi = 0;
+			const uint8_t *cmd_data = v->value.data;
+			uint16_t cmd_len = v->value.len;
+			uint8_t full[gattdb_ips_data_len];
+
+			if (v->att_opcode == sl_bt_gatt_prepare_write_request) {
+				/* One chunk of a queued write, already stored
+				 * by the stack at v->offset -- nothing is
+				 * complete yet, wait for execute_write_request.
+				 */
+				break;
+			}
+
+			if (v->att_opcode == sl_bt_gatt_execute_write_request) {
+				/* The queued write just committed. Read the
+				 * attribute back rather than trust this event's
+				 * own value/offset, which describe the commit
+				 * operation, not the reassembled data.
+				 */
+				size_t full_len = 0;
+
+				sc = sl_bt_gatt_server_read_attribute_value(
+					gattdb_ips_data, 0, sizeof(full),
+					&full_len, full);
+				app_assert_status(sc);
+				cmd_data = full;
+				cmd_len = (uint16_t)full_len;
+			}
 
 			/* Best-effort -- aps_put_cmd()'s rssi parameter is
 			 * recorded on the frame but not otherwise consumed
@@ -228,7 +293,7 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
 			 */
 			(void)sl_bt_connection_get_median_rssi(v->connection, &rssi);
 
-			aps_put_cmd(v->value.data, v->value.len, rssi);
+			aps_put_cmd(cmd_data, cmd_len, rssi);
 		} else if (v->attribute == gattdb_ips_custom_name) {
 			/*
 			 * Legacy behaviour (RFM69 reference repo's ips.h:

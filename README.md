@@ -62,6 +62,45 @@ effect on the next reconnect, as before). Verified against a from-scratch
 cache: the Service UUID and correct advertising flags (`06`) appear before
 any connection is made.
 
+**AAPS connected but "problem connecting to pump": AndroidAPS's long GATT
+writes weren't being reassembled.** `subg_rfspy` commands over ~20 bytes
+(anything using CMD_SEND_AND_LISTEN with a real payload -- short commands
+like CMD_GET_VER or CMD_UPDATE_REG were never affected) don't fit in one ATT
+write at the default MTU, so Android's BLE stack splits them into a GATT
+long write (Prepare Write + Execute Write) transparently to the app -- one
+`writeCharacteristic()` call, two ATT operations underneath. IPS Data is
+automatic (non-"user") GATT storage, so the stack delivers each queued
+chunk as its own `sl_bt_evt_gatt_server_attribute_value_id` event with an
+`offset` field describing the procedure; `start_advertising()`'s sibling
+handler ignored both `att_opcode` and `offset` and dispatched every chunk
+to `aps_put_cmd()` as if it were the whole command, so both fragments
+failed the self-consistency check and were silently dropped. Confirmed
+byte-for-byte against a real AndroidAPS log (`RFSpy.writeToDataRaw`, a
+21-byte CMD_SEND_AND_LISTEND frame) cross-referenced with RTT output from
+this firmware at the same moment. Fixed in `app_bluetooth.c`: Prepare Write
+chunks are skipped (the stack already reassembles them into the attribute's
+own backing store), and on Execute Write the full value is read back via
+`sl_bt_gatt_server_read_attribute_value()` before dispatch. Verified: a
+fresh AndroidAPS log after the fix shows CMD_UPDATE_REG writes getting real
+Response Count notifications (01, 02, 03, ...) instead of "No response from
+RileyLink".
+
+**Still no reply from the pump -- traced to the radio, not BLE.**
+`sl_subg_send_pkt()` called `sl_rail_write_tx_fifo()` and
+`sl_rail_start_tx()` without checking either return value, so a transmit
+that never actually left the radio was indistinguishable from one that sent
+fine and simply got no answer. Added real status checks (see "Diagnostic
+logging"); a live pump test now shows RAIL accepting the TX request without
+error, but the `SL_RAIL_EVENT_TX_PACKET_SENT` event never arriving --
+`radio: TX_PACKET_SENT never arrived` in the RTT log. This project is a
+Dynamic Multiprotocol build (BT + proprietary RAIL PHY sharing one radio
+core), and `sl_rail_start_tx()`'s own doc comment notes its
+`p_scheduler_info` parameter "is only used in multiprotocol version of RAIL"
+-- this driver has always passed `NULL`. That is the leading suspect: without
+scheduler info, the radio's multiprotocol arbiter may never actually grant
+the proprietary stack airtime against the running BLE connection. Not fixed
+yet -- see "Not started".
+
 ## Diagnostic logging
 
 This project shipped with zero logging infrastructure. Added real RTT-based
@@ -83,10 +122,17 @@ caught the bug above:
   sequence.
 
 Read it with `commander rtt connect -d EFR32ZG28B312F1024IM48` while the
-board is connected. `app.c` has one permanent checkpoint (the radio init
-result), and `src/aps/aps.c`'s own `APS_LOG_*` macros are wired to this same
-backend -- every command dispatch, frequency tune, and send/listen outcome
-is now visible over RTT, not just the boot-time radio check.
+board is connected. Buffer content survives a flash or SWD reset -- only a
+real power cycle (unplug/replug) clears it, which matters when comparing
+"is this fresh?" against a new test. `app.c` has one permanent checkpoint
+(the radio init result), `src/aps/aps.c`'s own `APS_LOG_*` macros are wired
+to this same backend, and `sl_subg_radio.c`'s `sl_subg_send_pkt()` now logs
+(first repeat only, since a real command can ask for 200+) if
+`sl_rail_write_tx_fifo()`/`sl_rail_start_tx()` report anything but full
+success, or if `SL_RAIL_EVENT_TX_PACKET_SENT` never arrives -- added while
+chasing the radio-scheduling issue below, and worth keeping: a transmit
+that silently never leaves the radio was otherwise indistinguishable from
+one that sent fine and got no reply.
 
 ## Architecture
 
@@ -164,14 +210,29 @@ probe.
 
 ## Not started
 
-- Nothing has talked to an actual pump. The bridge advertises, connects, and
-  exposes the right GATT service on real hardware, but no APS command has
-  been exercised against a Minimed pump yet.
+- **The proprietary radio never actually transmits against a live BLE
+  connection.** See "Still no reply from the pump" above -- `sl_rail_start_tx()`
+  reports success but `TX_PACKET_SENT` never fires. Leading suspect:
+  `sl_rail_start_tx()` is called with `p_scheduler_info = NULL` throughout
+  `sl_subg_radio.c`, but the SDK's own doc comment says that parameter "is
+  only used in multiprotocol version of RAIL" -- and this is one. Next step:
+  build a real `sl_rail_scheduler_info_t` (priority/requested duration) and
+  pass it to `sl_rail_start_tx()`, then re-test with the RTT TX-status
+  logging already in place; check whether `sl_subg_get_pkt()`'s RX path
+  needs the same treatment once TX is confirmed working. This is the actual
+  blocker for talking to a pump, not a BLE issue.
+- A real, separate frequency-tuning bug surfaced during the same test and is
+  still open: `apply_pending_freq()` logged `tune FAILED: asked 916649780 Hz,
+  radio reads 916548000 Hz` -- `sl_subg_set_freq()` snapped to the nearest
+  configured channel rather than reaching the frequency AndroidAPS asked
+  for, ~102 kHz off. Needs the project's Radio Configurator channel map
+  checked (channel spacing/count) once TX itself is confirmed working --
+  no point tuning correctly for packets that don't leave the radio.
 - Custom Name rename is RAM-only: no flash-backed settings storage exists
   yet, so it doesn't survive a power cycle the way "persist" implies in the
   legacy protocol.
-- TX power control (`sl_subg_set_power_level`) and frequency retuning
-  (`sl_subg_set_freq`) are implemented but not hardware-verified.
+- TX power control (`sl_subg_set_power_level`) is implemented but not
+  hardware-verified.
 
 ## License
 
