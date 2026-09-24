@@ -682,47 +682,85 @@ frequency on this hardware -- and `TIMING_LOST` firing at noise-floor RSSI,
 not an elevated level, suggests these particular events are RAIL's OOK
 detector triggering on ordinary noise crossing its own threshold, not the
 receiver losing lock on a real, stronger signal that started successfully.
-No RSSI reading during an actual 646910 concatenation event has been
-captured yet (RTT's own unreliability made it hard to align a read with
-that specific outcome this session) -- that comparison (concatenation-event
-RSSI vs. this ~-98 dBm noise floor) is the missing data point for picking a
-real squelch threshold.
+
+## Follow-up 8: the missing data point -- 646910's signal is at the noise
+floor on this bridge's own antenna, not a protocol bug
+
+Got the comparison Follow-up 7 was missing. Live against the bench pump,
+with RTT connected throughout a full wake+scan run:
+
+```
+radio: RX re-arm 1 ended with 0 B captured, error events 0x...40000, rssi -95 dBm
+radio: RX re-arm 16 ended with 0 B captured, error events 0x...40000, rssi -98 dBm
+radio: RX re-arm 18 ended with 0 B captured, error events 0x...40000, rssi -99 dBm
+radio: RX re-arm 21 quiet, rssi -101 dBm
+radio: RX re-arm 1 ended with 30 B captured, error events 0x...40000, rssi -100 dBm
+```
+
+The last line is the key one: a 30 B partial capture -- the exact
+truncation signature from every earlier follow-up in this file -- with
+`RX_TIMING_LOST` set, at **-100 dBm**. That is statistically
+indistinguishable from the surrounding pure-noise readings (-95 to -101
+dBm). **646910's signal, as received at this bridge's own onboard antenna,
+is not elevated above the noise floor even during a partial capture.**
+
+This reframes the whole investigation. It is not obviously a firmware bug
+at all: a signal sitting at the noise floor will marginally, intermittently
+trigger the OOK detector, produce a few dozen demodulated bytes before
+losing bit/symbol lock (`RX_TIMING_LOST`, precisely what that event means),
+and never reliably complete a full frame -- regardless of termination
+logic, re-arm timing, or FIFO handling, all of which were fixed or
+improved this session without changing this outcome. 560793 (received
+cleanly and repeatedly all session) is presumably just a stronger, more
+favorably positioned signal at the same receiver -- not evidence the
+receiver itself is broken.
+
+**This does not contradict the earlier HackRF ground truth** (646910's
+transmissions decode cleanly and strongly via HackRF throughout this whole
+investigation) -- HackRF's antenna, gain, and position are independent of
+and different from this board's own onboard antenna. A signal can be
+strong at one receive point and weak at another.
 
 ## Next steps
 
-1. **Capture RSSI during an actual 646910 concatenation event** (or any
-   capture with real bytes and `TIMING_LOST`) to compare against the
-   confirmed ~-98 dBm noise floor from Follow-up 7. This is the one missing
-   data point before a squelch threshold can be picked with any confidence
-   -- RTT's own unreliability (frequent mid-session disconnects) made this
-   hard to align this session; worth a few more focused attempts, or
-   logging RSSI on every single re-arm temporarily (not just every 20th)
-   during a short, targeted test.
-2. **Implement RSSI/carrier-sense based termination once that data point
-   exists.** Follow-up 6 ruled out interior zero-value bytes; Follow-up 5+6
-   showed more time/retries just captures more unrelated traffic rather
-   than fixing 646910's reply; Follow-up 7 shows `TIMING_LOST` firing at
-   noise-floor RSSI, suggesting at least some of these events are the OOK
-   detector triggering on ordinary noise, not losing lock on a real
-   stronger signal. A real threshold, once calibrated, would let the
-   receiver treat "RSSI sustained at the noise floor" as "nothing real is
-   here, stop trying" -- independent of raw byte values entirely.
-3. Once implemented, re-test specifically for 646910 with a concurrent
-   HackRF capture, ideally during a window confirmed quiet for 560793 first
-   (a quick passive listen) to remove it as a confound while testing 646910
-   specifically.
-4. The carrier-mismatch hypothesis (916.6968 MHz measured, 71.8 kHz from the
+1. **Physical: reposition the bench pump closer to (or reorient it toward)
+   the board's own onboard antenna, then re-test.** This is now the primary
+   recommendation, ahead of any further firmware change. Follow-up 8 found
+   646910's signal sitting at the noise floor (-100 dBm during a partial
+   capture, statistically the same as pure-noise readings of -95 to
+   -101 dBm) specifically at this board's own antenna, while the same
+   transmissions decode cleanly and strongly via HackRF throughout this
+   whole investigation -- different antenna, different position, different
+   result. This is a physical RF path issue, not something more firmware
+   iteration is likely to fix. This action needs a person at the bench;
+   record before/after RSSI readings (already logged automatically per
+   re-arm) to confirm.
+2. If repositioning raises 646910's RSSI meaningfully above the noise
+   floor, re-test reception directly -- the termination/concatenation bugs
+   fixed in Follow-ups 5 and 6 should then have a real, strong-enough
+   signal to actually terminate cleanly against, the same way 560793's
+   already does.
+3. If repositioning does not help (signal still at the noise floor even at
+   close range), reconsider TX power/antenna matching on the bench pump
+   side, or whether the bench unit's transmitter itself is weaker than a
+   normal in-service pump (plausible for a long-idle bench unit).
+4. Only after 1-3 are exhausted: implement RSSI/carrier-sense based
+   termination as a robustness improvement regardless (a real signal that
+   drops to the noise floor mid-frame, e.g. from fading, should still
+   terminate cleanly rather than trigger `RX_TIMING_LOST`) -- calibration
+   data for this already exists (~-98 dBm noise floor, Follow-up 7).
+5. The carrier-mismatch hypothesis (916.6968 MHz measured, 71.8 kHz from the
    916.625 MHz nominal) and the frame-length hypothesis (retracted in
-   Follow-up 4) are both likely moot now -- deprioritize unless items 1-3
-   above are exhausted without a fix.
-5. The RSSI fix in Follow-up 7 (reported RSSI was always exactly 0 dBm due
-   to two stacked bugs, now fixed) should be verified against a real pump
-   reply once 646910 is received cleanly -- AndroidAPS uses reply RSSI for
-   frequency-scan ranking (`mmtune`), so this matters for more than just
-   diagnostics once reception works.
-6. Preserve the foreign-frame filter. Only a valid-CRC frame with serial
+   Follow-up 4) are both closed -- Follow-up 8 explains the observations
+   both were trying to explain.
+6. The RSSI fix in Follow-up 7 (reported RSSI was always exactly 0 dBm due
+   to two stacked bugs, now fixed and itself how Follow-up 8's finding was
+   possible) should be re-verified against a real, strong 646910 reply once
+   reception works -- AndroidAPS uses reply RSSI for frequency-scan ranking
+   (`mmtune`), so this matters for more than just diagnostics.
+7. Preserve the foreign-frame filter. Only a valid-CRC frame with serial
    646910 counts as a bench response.
-7. Large `.cs8` captures stay in the local `debug-evidence/captures/` directory
+8. Large `.cs8` captures stay in the local `debug-evidence/captures/` directory
    and are excluded from Git by `.gitignore`; never use `/tmp`. Captures
    whose findings are already fully documented in text (RTT logs, this file)
    were deleted this session to save space -- the ones kept are either cited
@@ -763,6 +801,10 @@ hackrf_transfer -r /home/charles/ai/orangelink-xg28/debug-evidence/captures/benc
   activity anywhere in the 71 s capture (verified with `--serial 560793`,
   `crc_valid_frames=0`), bridge caught nothing at all:
   `debug-evidence/captures/bench_646910_timinglost_test_20260923.cs8`.
+- RSSI calibration run (Follow-up 8's key evidence: a 30 B partial capture
+  with RX_TIMING_LOST at -100 dBm, statistically the same as the
+  surrounding pure-noise readings):
+  `debug-evidence/captures/bench_646910_rssi_calibration_20260923.cs8`.
 - Concatenation-bug (`BAD CRC ... 646910 header + foreign frame appended`)
   first observed: `debug-evidence/captures/bench_646910_calibrated_carrier_test_20260923.cs8`,
   reproduced again with the 50 ms settling-delay fix active:

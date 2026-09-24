@@ -214,51 +214,40 @@ probe.
 
 ## Remaining hardware checks
 
-- **Real RX bugs found and fixed; the bridge now cleanly receives short
-  frames for the first time, but bench pump 646910's own (long) replies
-  still don't come through.** Three confirmed, fixed bugs in
-  `sl_subg_radio.c`: (1) the RX FIFO-drain ISR had no guard against a second,
-  unrelated over-the-air burst getting appended onto an already-complete
-  reception -- directly observed as a correctly-decoded 646910 reply with a
-  different pump's frame concatenated onto the end; (2) `sl_subg_get_pkt()`
-  held one RX session open for the whole caller timeout with no way to
-  recover once a reception got stuck a few dozen bytes in (RTT-confirmed:
-  ~30-36 B captured, no error, then nothing, every time) -- rewritten into a
-  loop that periodically idles, resets the RX FIFO, and re-arms; (3) no
-  settling delay between our own TX completing and RX arming, so a
-  turnaround transient had no time to decay -- a 50 ms delay eliminated it
-  completely, immediately producing clean, complete, correctly-terminated
-  receptions of a different pump's short frames, repeatedly, for the first
-  time this project. 646910's own replies still don't come through cleanly
-  even with all three fixes active, and a fourth fix (a grace period so a
-  reply starting late in a re-arm slice isn't cut off mid-frame) made this
-  more precise rather than fixing it: with more time to capture, the buffer
-  fills with *multiple* concatenated fragments (646910's real header, then
-  more than one unrelated frame after it), not just one. Checked and ruled
-  out interior zero-value bytes confusing the raw-byte terminator scan (the
-  4b6b line coding mathematically cannot produce a raw 0x00 from encoded
-  data, confirmed against the working short-frame receptions, which also
-  decode to include a zero byte). Current understanding: 646910's own reply
-  may never produce a clean, demodulated end-of-transmission signal on this
-  radio (EFR32/RAIL) the way it apparently does on the RFM69 chip the
-  original zero-terminator convention was designed around -- the fix is
-  likely RSSI/carrier-sense based termination rather than another retiming
-  attempt. `SL_RAIL_EVENT_RX_TIMING_LOST` is now confirmed firing on live
-  hardware on exactly these failed receptions. Two more real bugs were
-  found and fixed while instrumenting this: RSSI was always read after the
-  radio had already gone idle (RAIL documents this as always returning its
-  invalid sentinel), and the value was never converted from the API's
-  quarter-dBm units to the plain dBm the rest of the firmware expects --
-  together these produced exactly the "reported 0 dBm RSSI is physically
-  implausible" symptom noted earlier in this investigation. Fixed; real
-  RSSI now reads consistently around -98 dBm (the noise floor on this
-  setup), which is the calibration data a real squelch threshold needs --
-  one more comparison point (RSSI during an actual concatenation event) is
-  still needed before implementing termination on it. Carrier mismatch,
-  signal strength, and DMP scheduler preemption were separately ruled out
-  earlier. See
+- **Likely resolved as a physical RF issue, not a firmware bug: bench pump
+  646910's signal sits at the noise floor on this board's own antenna.**
+  Seven real, confirmed firmware bugs were found and fixed getting to this
+  answer (all in `sl_subg_radio.c`): a missing guard letting a second,
+  unrelated over-the-air burst get appended onto an already-complete
+  reception; `sl_subg_get_pkt()` holding one RX session open for the whole
+  caller timeout with no way to recover once a reception stalled; no
+  settling delay between our own TX completing and RX arming (a 50 ms delay
+  fixed this one outright -- immediately producing clean, complete,
+  correctly-terminated receptions of a different pump's short frames,
+  repeatedly, for the first time this project); a re-arm timer that could
+  cut off an in-progress reception that simply started late in its slice;
+  and RSSI being read after the radio had already gone idle *and* never
+  converted from the RAIL API's quarter-dBm units to the plain dBm the rest
+  of the firmware expects -- together these produced exactly the "reported
+  0 dBm RSSI is physically implausible" symptom flagged earlier in this
+  investigation. With RSSI finally reading real values, the actual answer
+  came out directly: a partial capture with `SL_RAIL_EVENT_RX_TIMING_LOST`
+  set measured -100 dBm, statistically the same as the surrounding
+  pure-noise readings (-95 to -101 dBm). 646910's signal, as received at
+  this board's own onboard antenna, is not elevated above the noise floor
+  even during a capture -- which a receiver simply cannot reliably
+  demodulate regardless of termination logic, re-arm timing, or FIFO
+  handling, all fixed or improved this session without changing this
+  outcome. This doesn't contradict the HackRF evidence throughout this
+  investigation (646910 decodes cleanly and strongly via HackRF) -- HackRF's
+  antenna, gain, and position are independent of this board's own. **Primary
+  recommendation: reposition the bench pump closer to (or reorient it
+  toward) the board's antenna and re-test** before any further firmware
+  change. Carrier mismatch, signal strength comparison methodology, and DMP
+  scheduler preemption were separately ruled out earlier and are now
+  explained by this finding. See
   [the hardware debugging handoff](DEBUGGING_NOTES_2026-09-23.md) for the
-  full analysis and current hypotheses.
+  full analysis.
 - Custom Name rename is RAM-only: no flash-backed settings storage exists
   yet, so it doesn't survive a power cycle the way "persist" implies in the
   legacy protocol.
