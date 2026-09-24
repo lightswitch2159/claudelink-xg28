@@ -295,17 +295,81 @@ firmware still does not deliver those bench responses to the host.
   wake has not been shown to succeed. Inspect its repository status before
   attributing ownership or committing it.
 
+## Follow-up: the fault is timing, not receiver hardware/DMP preemption
+
+Continued the same day. Two changes preceded this test: (1) `sl_subg_radio.c`
+now enables and records `RX_PACKET_ABORTED`/`RX_FRAME_ERROR`/`RX_FIFO_OVERFLOW`
+(previously never enabled at all, so a Dynamic-Multiprotocol protocol switch
+destroying an in-flight receive mid-packet -- `sl_rail_config_rx_data()`'s own
+doc note that a shared RX FIFO/Packet Queue "will be reset during a protocol
+switch" -- would have been invisible); RX priority was checked against
+Silicon Labs' own `rail_bt_dmp_soc_range_test` reference and matches it
+exactly (200), so that was not the gap. (2) A HackRF capture was run
+*simultaneously* with the probe this time (prior runs analyzed in this file
+were not always captured live alongside the exact BLE probe that produced
+them).
+
+Ran the suggested command from this file verbatim (bench serial 646910 only)
+with `hackrf_transfer` capturing concurrently to
+`debug-evidence/captures/bench_646910_rx_diag_run2_20260923.cs8` (90 s,
+916.100 MHz centre, 2 Msps). Offline decode
+(`tools/decode_ook_serials.py ... --all`) is unambiguous:
+
+- t=25.7-30.1 s: the host's own wake frame (`a76469108d00b3`) leaking into
+  the capture -- this is our TX, confirmed by exact byte match against the
+  probe's own printed request frame, not a pump reply.
+- t=56.0 s onward: bench pump 646910 begins replying with real, CRC-valid
+  71-byte model frames (text `722`), and keeps replying steadily through
+  t=88.7 s -- 15 valid replies total.
+- A separate valid frame from the other pump, serial 560793, was also
+  decoded at 916.700 MHz during the bridge's own stage-2 scan and correctly
+  reported by the probe as `FOREIGN FRAME ...; ignored` -- proving the RX
+  chain decodes real over-the-air frames correctly in this exact session,
+  ruling out a fundamentally broken receiver.
+- The new RX error-event logging stayed silent for the entire run (no
+  `RX_PACKET_ABORTED`/`FRAME_ERROR`/`FIFO_OVERFLOW`, confirmed via RTT) --
+  consistent with "never listening at the right moment," not "packet
+  destroyed mid-receive."
+
+**The timing does not line up.** The wake burst (201 repeats) finishes
+transmitting by ~t=30 s. The probe's wake-stage listen window is 25000 ms,
+so the bridge stops listening at ~t=55.1 s. The pump's first reply arrives
+at t=56.0 s -- under one second after the listen window closed. Stage 2 (the
+frequency scan) starts immediately after and dwells only 1250 ms x 3 tries
+(3.75 s) per frequency across 8 frequencies (~30 s per full cycle), against
+a pump reply cadence of roughly 1.5-2.5 s once it starts (56.0, 57.5, 59.0,
+61.5, 62.9, 64.4, 66.5, 67.9, 69.4, 71.4, 72.9, 74.3, 77.9, 79.4, then a gap
+to 86.3, 88.7) -- short dwell relative to that cadence, and none of the
+scan's 50 kHz-stepped frequencies (916.45 through 916.80) exactly matches
+the reply carrier's earlier uncalibrated ~916.670-916.694 MHz estimate.
+
+This reframes the investigation: the leading hypothesis is no longer DMP
+scheduler preemption or a broken RX FIFO-mode configuration. It is that
+**the bridge's fixed 25 s wake-listen window is not long enough for this
+bench pump to start replying, and the follow-up scan's short per-frequency
+dwell does not reliably catch a pump that only replies every 1.5-2.5 s once
+awake.** Whether AndroidAPS's real (non-bench) timing assumption of 25 s is
+simply wrong for this specific bench unit, or something about this bridge's
+own TX burst adds delay before the pump considers itself woken, is not yet
+established.
+
 ## Next steps
 
-1. Find why RAIL does not capture/deliver the 646910 frames that HackRF decoded
-   during the same run. Correlate RTT radio events and actual RX tune with the
-   response carrier; then fix and reflash the xG28 driver.
-2. If hardware capture resumes, record the 916.670–916.730 MHz fine scan at the
-   same time on HackRF to determine whether reply carriers move with each
-   requested frequency.
-3. Preserve the foreign-frame filter. Only a valid-CRC frame with serial
+1. Test with the wake-stage listen window extended well past the observed
+   ~26 s pump-wake delay (e.g. 45-60 s) against bench pump 646910 only, with
+   a simultaneous HackRF capture, to confirm the reply is captured when the
+   window is long enough. This is now the primary hypothesis to confirm or
+   rule out before touching the RX driver further.
+2. If confirmed, reconsider stage 2's dwell time and frequency step against
+   the pump's real ~1.5-2.5 s reply cadence -- 3.75 s per frequency across
+   8 frequencies may still miss it depending on alignment.
+3. The DMP RX-error-event instrumentation added this session
+   (`s_rx_error_events` in `sl_subg_radio.c`) should stay in place regardless
+   -- it produced a clean negative result here (no aborts/errors), which is
+   itself evidence, and costs nothing to keep watching on future tests.
+4. Preserve the foreign-frame filter. Only a valid-CRC frame with serial
    646910 counts as a bench response.
-4. Large `.cs8` captures stay in the local `debug-evidence/captures/` directory
+5. Large `.cs8` captures stay in the local `debug-evidence/captures/` directory
    and are excluded from Git by `.gitignore`; never use `/tmp`.
 
 Suggested active command (use this interpreter path, BLE device, and bench

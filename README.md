@@ -214,10 +214,18 @@ probe.
 
 ## Remaining hardware checks
 
-- **Bridge receive still needs repair.** HackRF decoded valid 646910 responses
-  over the air, while the bridge's 50 kHz and targeted 5 kHz BLE scans returned
-  silent. Correlate RAIL RX timing/channel metadata with the captured response
-  carriers, then verify the fix against bench pump 646910.
+- **Bridge listen window is likely too short, not the receiver.** A
+  simultaneous HackRF capture during a live bench-pump (646910) test proved
+  the RX chain itself works -- it decoded a real frame from a different pump
+  mid-scan in the same run -- but bench pump 646910 didn't start replying
+  until ~26 seconds after the wake burst finished, about a second after the
+  bridge's 25-second wake-listen window had already closed. RX error-event
+  logging (`RX_PACKET_ABORTED`/`RX_FRAME_ERROR`/`RX_FIFO_OVERFLOW`, added
+  this session) stayed clean throughout, arguing against a Dynamic
+  Multiprotocol scheduler preemption. Next step: re-test with the wake-listen
+  window extended well past the observed delay. See
+  [the hardware debugging handoff](DEBUGGING_NOTES_2026-09-23.md) for the
+  full timing analysis.
 - Custom Name rename is RAM-only: no flash-backed settings storage exists
   yet, so it doesn't survive a power cycle the way "persist" implies in the
   legacy protocol.
