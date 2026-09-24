@@ -214,21 +214,20 @@ probe.
 
 ## Remaining hardware checks
 
-- **Bridge may fail specifically on long (~71-byte) received frames.**
-  Ruled out first: listen duration (a 60-second window still missed ~20 real
-  in-window replies) and carrier mismatch (646910's true reply carrier was
-  measured precisely at 916.6968 MHz from confirmed-reply timestamps, and
-  tuning wake+listen within 3 kHz of it still caught zero of 3 confirmed
-  in-window replies) and signal strength (646910's measured amplitude is
-  comparable to or stronger than the pump that *does* get through). RX
-  error-event logging added this session stayed clean throughout, arguing
-  against Dynamic Multiprotocol scheduler preemption too. Current leading
-  lead: every frame the bridge has ever been confirmed to catch this session
-  was the same short 7-byte frame from a different pump; it has never caught
-  a long (~71-byte decoded) frame from either pump, and 646910's only
-  reply type is long. RX never overrides the fixed-length/FIFO config
-  per-reception the way TX does per-transmission -- worth checking as the
-  concrete next step. See
+- **Bridge still doesn't receive bench pump 646910's replies; cause not yet
+  found.** Ruled out: listen duration (a 60-second window still missed ~20
+  real in-window replies), carrier mismatch as the sole cause (646910's true
+  reply carrier was measured precisely at 916.6968 MHz from confirmed-reply
+  timestamps, and tuning wake+listen within 3 kHz of it still caught zero of
+  3 confirmed in-window replies), signal strength (646910's measured
+  amplitude is comparable to or stronger than a different pump that *does*
+  get through), and Dynamic Multiprotocol scheduler preemption (RX
+  error-event logging stayed clean on every run). A frame-length hypothesis
+  (long ~71-byte frames failing while short ones succeed) was raised and
+  then retracted -- the test tool never actually distinguished short from
+  long receptions in its output, so the evidence for it didn't hold up on
+  review; the tool now prints frame length so this is checkable on the next
+  test. See
   [the hardware debugging handoff](DEBUGGING_NOTES_2026-09-23.md) for the
   full analysis.
 - Custom Name rename is RAM-only: no flash-backed settings storage exists

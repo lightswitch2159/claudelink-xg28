@@ -457,7 +457,7 @@ affects tests 2 and 3 -- and it weakens the simple carrier-mismatch
 hypothesis: tuning within 3 kHz of the pump's own measured carrier did not
 recover reception on its own.
 
-## Follow-up 4: signal strength ruled out; frame length is the new lead
+## Follow-up 4: signal strength ruled out; frame-length claim retracted (see below)
 
 Compared raw HackRF amplitude (peak/RMS, dBFS) at 646910's three confirmed
 reply timestamps against five of 560793's confirmed frame timestamps, all
@@ -468,62 +468,66 @@ than* several of 560793's measurements (-16.6 to -0.5 dBFS RMS, quite
 variable). **646910's signal is not weaker** -- rules out a simple
 sensitivity/RSSI explanation.
 
-Re-examined what the bridge has actually, confirmedly received all session:
-every "FOREIGN FRAME serial=560793" the bridge reported catching (multiple
-times, across several tests today) corresponds to the *same short 7-byte*
-560793 frame (`a75607938d0093`, op=0x8d, confirmed against the capture's own
-decode: `t=20.8884s serial=560793 op=0x8d len=7`). 560793 also transmitted
-many long (67-71 byte) frames in the very same capture window (0x06 ACKs are
-short, but 0x80 data frames are long) -- none of those were ever reported
-caught by the bridge either. **Across every test run this session, the
-bridge has never once been confirmed to receive a long frame (the ~71-byte
-decoded / ~107-byte encoded class that 646910's model reply belongs to)
-from *either* pump -- only short (7-byte) frames, and only from 560793.**
+**RETRACTED: the frame-length claim below this paragraph was wrong, and the
+error is worth recording.** `probe_722_aaps.py`'s `interpret()` never printed
+length, RSSI, or raw bytes for a FOREIGN FRAME -- only `serial` and `op`
+(see the function itself, `tools/rf/probe_722_aaps.py` around line 125-127
+before this session's fix below). Every claim in the retracted paragraph
+about "the bridge only ever caught the short 7-byte 560793 frame" was
+inferred by matching a bare `op=0x8d` report against the *one* op=0x8d frame
+found in *one specific* capture file, then wrongly generalized to every
+FOREIGN FRAME report across all six tests. The extended-window capture
+(`bench_646910_extended_wake_20260923.cs8`) independently contains 560793
+frames with op=0x8d at BOTH len=7 (t=19.37s) and len=71 (t=22.62s), plus
+further long frames at op=0x98 (t=23.22s) and op=0x4c (t=26.66s) -- and
+nothing establishes which one, if any, the bridge actually reported during
+that test's own FOREIGN FRAME line. The premise "the bridge has never caught
+a long frame" was never actually verified. Caught by the user reviewing the
+raw capture output directly, not by any check on this end.
 
-This is a better unifying explanation than carrier mismatch: it accounts for
-646910 never being received (its only relevant reply is long) without
-requiring any pump-to-pump difference in signal strength or carrier
-accuracy. It also lines up with a real asymmetry already visible in
-`sl_subg_radio.c`: TX explicitly overrides the frame length per-transmission
-with `sl_rail_set_fixed_length()` (`tx_frame_len = len + 1`, reset to
-`SL_RAIL_SET_FIXED_LENGTH_INVALID` after), but RX never calls
-`sl_rail_set_fixed_length()` at all -- it always runs against whatever the
-Radio Configurator's own default fixed length is (107 bytes, the documented
-RX ceiling). Not yet confirmed as the actual defect; recorded here as the
-leading, concrete, testable hypothesis.
+Fixed for future tests: `interpret()` now also prints `len=`/`rssi=` for
+FOREIGN FRAME reports (same session, `tools/rf/probe_722_aaps.py`), so the
+next live test can actually distinguish short vs. long receptions from the
+probe's own output instead of requiring error-prone cross-referencing
+against a separate capture file. The frame-length hypothesis is neither
+confirmed nor ruled out -- it needs re-testing with the fixed tool before it
+can be trusted either way.
 
 ## Next steps
 
-1. **Zero-RF-cost check first:** confirm directly whether short vs. long is
-   really the dividing line by checking `sl_rail_config_rx_data()`'s
+1. **Re-test with the now-fixed tool first.** `probe_722_aaps.py`'s FOREIGN
+   FRAME report now prints `len=`/`rssi=` (fixed this session -- it
+   previously printed only `serial=`/`op=`, which is what produced the
+   retracted frame-length claim above). A fresh live test against 646910,
+   or a passive listen that happens to catch a long 560793 frame, will show
+   directly whether the bridge catches short frames only, long frames too,
+   or nothing at all -- no more cross-referencing a separate capture file
+   required. This settles the frame-length question before anything else
+   below is worth pursuing.
+2. If that confirms short-only reception: check `sl_rail_config_rx_data()`'s
    parameters and the RX fixed-length/FIFO-threshold interaction in
    `sl_subg_radio.c` against the RAIL SDK docs -- specifically whether a
    107-byte fixed-length RX configured for FIFO mode with a 1-byte threshold
-   has any known failure mode for longer receptions (e.g. FIFO wrap,
-   threshold re-arming, buffer overflow past `SL_SUBG_FIFO_BYTES` = 128).
-2. **Low-RF-cost live check:** a passive `--listen-only` session at a
-   frequency/time known to carry one of 560793's own *long* frames (0x80
-   data, confirmed present in existing captures) would test the
-   short-vs-long hypothesis without needing the bench pump to cooperate at
-   all -- 560793 already appears to be in active, ongoing communication with
-   another system, producing long frames on its own schedule. Tried once
-   this session (`passive_560793_longframe_check_20260923.cs8`, 45 s,
-   916.6968 MHz, no TX at all): only 12 bursts total, none reaching the
-   20-byte threshold -- 560793 simply didn't transmit a long frame during
-   this particular window. Inconclusive, not a negative result; worth
-   retrying, ideally over a longer window or with the capture centred to
-   also cover the other frequencies 560793 has been heard at.
-3. If confirmed, the fix is almost certainly on the RX side of
-   `sl_subg_radio.c`: give RX an explicit fixed-length override (mirroring
-   TX's own per-call `sl_rail_set_fixed_length()`), or investigate why the
-   FIFO-mode 1-byte-threshold drain loop might not reliably keep up with or
-   terminate correctly on a full ~107-byte reception.
+   has any known failure mode for longer receptions (FIFO wrap, threshold
+   re-arming, buffer overflow past `SL_SUBG_FIFO_BYTES` = 128) -- then give
+   RX an explicit fixed-length override mirroring TX's own per-call
+   `sl_rail_set_fixed_length()`.
+3. A low-RF-cost passive `--listen-only` session at a frequency/time known
+   to carry one of 560793's own long frames (0x80 data, confirmed present in
+   existing captures) is the cheapest way to test short-vs-long without
+   needing the bench pump to cooperate -- 560793 already appears to be in
+   active, ongoing communication with another system on its own schedule.
+   Tried once this session (`passive_560793_longframe_check_20260923.cs8`,
+   45 s, 916.6968 MHz, no TX at all): only 12 bursts total, none reaching
+   the 20-byte threshold -- inconclusive, not a negative result; worth
+   retrying with the fixed tool so the result is unambiguous either way.
 4. The carrier-mismatch hypothesis (916.6968 MHz measured, 71.8 kHz from the
-   916.625 MHz nominal) is not fully closed -- it may still be a secondary
-   contributing factor -- but is no longer the leading explanation given
-   Follow-up 3's uncontaminated negative test at the calibrated frequency.
-5. Minimize further live bench-pump wake cycles until the frame-length
-   hypothesis is checked -- five wake cycles were already run this session.
+   916.625 MHz nominal) is not fully closed either -- it may still be a
+   contributing factor -- but Follow-up 3's uncontaminated test (wake+listen
+   within 3 kHz of the calibrated carrier, pump replied 3 times in-window,
+   bridge caught none) argues against it being the sole explanation.
+5. Minimize further live bench-pump wake cycles until item 1 above is run --
+   six wake cycles were already run this session.
 6. The DMP RX-error-event instrumentation added this session
    (`s_rx_error_events` in `sl_subg_radio.c`) should stay in place regardless
    -- it produced a clean negative result on every run this session (no
