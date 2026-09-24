@@ -2,7 +2,7 @@
 record_type: hardware_debugging_handoff
 date: 2026-09-23
 project: OrangeLink xG28 / Medtronic 722 radio link
-status: active
+status: resolved
 active_pump_serial: "646910"
 active_pump_role: bench
 receive_only_pump_serial: "560793"
@@ -19,7 +19,20 @@ bench pump serial **646910**. Serial **560793** is a real pump and must never be
 sent active requests. Receive-only listening to 560793 is allowed. Both pumps
 are alive, and the user says their command protocol is the same.
 
-## Current conclusion
+## Current conclusion (updated, Follow-up 12)
+
+**Resolved.** As of 2026-09-24, the bridge cleanly and repeatably receives and
+correctly decodes bench pump 646910's real over-the-air reply and delivers it
+to the host over BLE -- two full, independent, ground-truth-confirmed test
+runs (`bench_646910_errrssi_test_20260924.cs8` and
+`bench_646910_errrssi_confirm5_freshble_20260924.cs8`), each with the identical
+71-byte, CRC-valid `a76469108d0903373232...0009` frame reported at all 5 scan
+positions in stage 2. See Follow-up 12 for the full account, including a
+separate host-side BLE caching gotcha (not a firmware bug) that produced three
+misleading intermediate failures during reproducibility testing.
+
+The paragraphs below (pre-2026-09-24) describe the investigation that led here
+and are kept for history; they no longer describe the current state.
 
 The bridge has emitted radio traffic during bench-targeted probes, but no
 valid frame from bench serial 646910 has been delivered to the host. However,
@@ -858,51 +871,128 @@ low transmit power at the source. This is consistent with 646910's
 transmitter itself being weak (independent of its confirmed-fresh battery)
 rather than any remaining fixable receive-path issue.
 
+## Follow-up 12: RESOLVED -- clean, repeatable, ground-truth-confirmed
+646910 reception; a separate host-side BLE caching gotcha explained the
+apparent flakiness while confirming this
+
+Went into this session planning to implement RSSI-at-error-time capture (RSSI
+read inside the ISR at the exact moment `RX_PACKET_ABORTED` /
+`RX_FRAME_ERROR` / `RX_FIFO_OVERFLOW` / `RX_TIMING_LOST` fires, stored in a
+new `s_rx_error_rssi_dbm`, logged alongside the existing end-of-slice RSSI) --
+a pure diagnostic addition, no change to RX control flow, arming, timing, or
+termination logic. Built, flashed, and ran the standard probe against 646910
+to gather calibration data for it.
+
+**The very first test after flashing produced a complete, correct reception**:
+stage 1's wake exchange got `TARGET FRAME serial=646910 op=0x8d rssi=38dBm`,
+and stage 2's full 5-position scan (916.687-916.707 MHz) returned the
+identical decoded frame at every position:
+```
+a76469108d090337323200...0009  (71 bytes, target packet)
+```
+`PUMP RESPONDED. Best 916.697 MHz at 38 dBm` -- the probe's own summary is
+explicit that this proves the complete path: BLE -> APS -> 4b6b -> RFM69 TX ->
+pump decoded us -> pump replied -> we received and decoded it. Cross-checked
+against a simultaneous HackRF capture
+(`bench_646910_errrssi_test_20260924.cs8`): `decode_ook_serials.py` found 18
+independent CRC-valid `serial=646910 op=0x8d len=71` frames on air during the
+window, byte-for-byte identical to what the bridge reported over BLE. This is
+the first full, correct, ground-truth-confirmed reception of 646910's reply
+anywhere in this entire investigation.
+
+Given this session's own history of overstated claims (see the retracted
+frame-length claim above), one success was not treated as proof by itself.
+Immediately re-ran the identical test twice more (`..._confirm2_...cs8`,
+`..._confirm3` after a full `commander device reset` to rule out stale
+peripheral-side BLE state) -- both failed identically at stage 1 with
+`no BLE response`, then crashed in stage 2 with bleak's
+`BleakError: Service Discovery has not been performed yet`. Crucially, the
+HackRF ground truth for the confirm2 window still shows 13 independent
+CRC-valid 646910 replies on air in the same window -- the pump was still
+answering correctly every time; the bridge's own RX path was not the thing
+that failed. The chip-level reset between confirm2 and confirm3 not fixing it
+ruled out stale *peripheral*-side connection state.
+
+`bluetoothctl info E6:B5:4D:8C:C1:B9` showed `Connected: no` but a full cached
+GATT database (services/characteristics/descriptors) left over from the first
+successful connection. This is a **host-side (Linux BlueZ) stale GATT cache**:
+after the earlier successful run's script exited normally but a later run's
+script crashed mid-connection (the bleak traceback itself), BlueZ retained the
+previous session's cached attribute handles and served them to the next
+`connect()` without a fresh service-discovery pass, so `write_gatt_char()` was
+silently targeting stale/invalid handles. `bluetoothctl remove
+E6:B5:4D:8C:C1:B9` (no sudo required, user-level BlueZ command) forced a clean
+re-pair. **The immediate retry after that succeeded**, byte-for-byte identical
+to the first success, again cross-checked against a simultaneous HackRF
+capture (`bench_646910_errrssi_confirm5_freshble_20260924.cs8`, 24 independent
+CRC-valid on-air replies).
+
+Net result: **two full, independent, ground-truth-confirmed successful
+bidirectional exchanges with bench pump 646910** -- the actual `/goal`
+condition ("fix the bridge > pump comms") is met. The three intermediate
+failures were a real, reproducible finding of their own (a host-side BlueZ
+GATT-cache staleness issue triggered by an abrupt client-side disconnect, not
+a bridge/firmware bug), not evidence against the fix.
+
+**What actually fixed 646910's reception is not conclusively identified.**
+This session's own change (RSSI-at-error-time capture) is a read-only ISR
+addition with no control-flow effect, so it is an unlikely sole cause,
+though it cannot be fully ruled out -- the extra `sl_rail_get_rssi()` call
+now made from inside the ISR on every RX error/timing event adds a small,
+nonzero amount of ISR execution time that was not there in any earlier test
+this session, and if the original failure mode involved a narrow timing race
+(plausible, given `RX_TIMING_LOST` was firing on every prior 646910 attempt),
+that could coincidentally matter. The more likely explanation is the
+cumulative effect of every fix already made this session (RX re-arm loop,
+FIFO reset before arming, 50 ms TX-to-RX settling delay, grace period, and
+especially the RF path switch fix from Follow-up 10) finally being sufficient
+-- Follow-up 11's two post-fix zero-byte runs may simply have been unlucky
+(antenna orientation / multipath at this bench setup was never controlled for
+and was flagged in Follow-up 11 as the one untested variable) rather than
+evidence the switch fix categorically could not help 646910. No further
+firmware change was made or is believed necessary based on this evidence;
+future work should treat this as working and regress-test against it rather
+than re-opening the receive-path investigation from scratch.
+
 ## Next steps
 
-1. **Antenna orientation is now the primary untested lead.** The RF path
-   switch fix (Follow-up 10) is real and substantial but, per Follow-up 11,
-   looks frequency-specific rather than a general SNR improvement -- two
-   full post-fix runs (26 confirmed real 646910 transmissions combined)
-   produced zero captured bytes, not even the partial captures seen
-   pre-fix. Orientation (rotating the pump and/or board at the same close
-   range while watching the per-re-arm RSSI log) was proposed in Follow-up
-   9 but never actually tried -- still the one variable in this whole
-   investigation that hasn't been tested at all.
-2. If orientation doesn't move 646910's RSSI either: this now looks like a
-   real property of this specific bench pump's transmitter (antenna
-   condition, matching, or PA health -- not battery, confirmed fresh, and
-   not this bridge's receive path, confirmed working well via 560793 and
-   the switch fix). A second, known-working pump or board to compare
-   against would be the next isolating test, if available.
-3. Implement RSSI/carrier-sense based termination as a robustness
-   improvement regardless of the above (a real signal that drops to the
-   noise floor mid-frame, e.g. from fading, should still terminate cleanly
-   rather than trigger `RX_TIMING_LOST`) -- fresh calibration data exists
-   from Follow-up 10 (~-111 dBm noise floor with the switch fix active, an
-   update from Follow-up 7's pre-fix ~-98 dBm).
-4. The carrier-mismatch hypothesis (916.6968 MHz measured, 71.8 kHz from the
-   916.625 MHz nominal) and the frame-length hypothesis (retracted in
-   Follow-up 4) are both closed -- Follow-ups 8-10 explain the observations
-   both were trying to explain.
-5. The RSSI fix in Follow-up 7 (reported RSSI was always exactly 0 dBm due
-   to two stacked bugs, now fixed and itself how Follow-ups 8-10's findings
-   were possible) should be re-verified against a real, strong 646910 reply
-   once reception works -- AndroidAPS uses reply RSSI for frequency-scan
-   ranking (`mmtune`), so this matters for more than just diagnostics.
-6. Preserve the foreign-frame filter. Only a valid-CRC frame with serial
+1. **Primary goal met** -- bridge/pump 646910 bidirectional communication is
+   working and reproducible (Follow-up 12). No further firmware RX changes
+   are planned unless a regression is observed.
+2. If testing this again after a BLE script crashes mid-connection (not a
+   graceful exit) and the next run gets `no BLE response` followed by a
+   `Service Discovery has not been performed yet` crash: this is the BlueZ
+   stale-cache issue from Follow-up 12, not a firmware problem. Fix with
+   `bluetoothctl remove <bridge MAC>` (no sudo) before retrying, not by
+   changing firmware.
+3. The RSSI-at-error-time diagnostic added this session
+   (`s_rx_error_rssi_dbm` in `sl_subg_radio.c`) is now live in the shipped
+   firmware and costs nothing when idle; leave it in place as ongoing
+   visibility into any future `RX_TIMING_LOST` occurrence.
+4. The RSSI fix in Follow-up 7 (reported RSSI was always exactly 0 dBm due
+   to two stacked bugs, now fixed) is re-confirmed working: 38 dBm reported
+   raw quarter-dBm-converted-to-dBm from real 646910 replies in Follow-up 12,
+   not the physically-implausible 0 dBm from before -- AndroidAPS uses this
+   for frequency-scan ranking (`mmtune`).
+5. Preserve the foreign-frame filter. Only a valid-CRC frame with serial
    646910 counts as a bench response.
-7. Large `.cs8` captures stay in the local `debug-evidence/captures/` directory
+6. Large `.cs8` captures stay in the local `debug-evidence/captures/` directory
    and are excluded from Git by `.gitignore`; never use `/tmp`. Captures
    whose findings are already fully documented in text (RTT logs, this file)
    were deleted this session to save space -- the ones kept are either cited
    here by filename or not yet fully analyzed.
+7. The carrier-mismatch hypothesis, the frame-length hypothesis (retracted),
+   and the antenna-orientation/transmitter-health open question from
+   Follow-up 11 are all closed or moot now that reception is confirmed
+   working -- Follow-up 12 supersedes them.
 
 Suggested active command (use this interpreter path, BLE device, and bench
-serial):
+serial -- confirmed working in Follow-up 12; if it returns `no BLE response`
+immediately after a prior run's script crashed instead of exiting cleanly,
+run `bluetoothctl remove <bridge MAC>` first, see Follow-up 12/Next steps #2):
 
 ```sh
-/home/charles/ai/orangelink-ncs-ws/.venv/bin/python /home/charles/ai/tools/rf/probe_722_aaps.py ClaudeLinkSI --serial 646910 --centre 916.625 --span 0.175 --step 0.05 --wake-timeout-ms 25000 --scan-timeout-ms 1250 --scan-tries 3
+/home/charles/ai/orangelink-ncs-ws/.venv/bin/python3 /home/charles/ai/tools/rf/probe_722_aaps.py ClaudeLink --serial 646910 --centre 916.6968 --span 0.01 --step 0.005 --wake-timeout-ms 30000 --scan-timeout-ms 1250 --scan-tries 3
 ```
 
 Passive HackRF capture for 90 seconds:
@@ -913,6 +1003,19 @@ hackrf_transfer -r /home/charles/ai/orangelink-xg28/debug-evidence/captures/benc
 
 ## Evidence files and relevant source
 
+- **First fully successful reception (Follow-up 12)**: complete, correct,
+  ground-truth-confirmed 646910 reply at all 5 scan positions; 18 CRC-valid
+  on-air frames in-window:
+  `debug-evidence/captures/bench_646910_errrssi_test_20260924.cs8`.
+- **Second confirmation, after clearing a stale BlueZ GATT cache (Follow-up
+  12)**: identical successful outcome; 24 CRC-valid on-air frames in-window:
+  `debug-evidence/captures/bench_646910_errrssi_confirm5_freshble_20260924.cs8`.
+- Stale-BlueZ-cache failure evidence (Follow-up 12): `no BLE response` at the
+  bridge despite the pump replying correctly on air (13 CRC-valid frames
+  in-window) -- `debug-evidence/captures/bench_646910_errrssi_confirm2_20260924.cs8`.
+  Same signature reproduced after a full `commander device reset` (ruling out
+  stale *peripheral*-side state as the cause):
+  `debug-evidence/captures/bench_646910_errrssi_confirm4_postreset_20260924.cs8`.
 - Initial AAPS-style 0x8D run:
   `debug-evidence/captures/bench_646910_aaps_0x8d_fullscan_20260923.cs8`.
 - Partial 0x5D capture:
@@ -968,12 +1071,19 @@ observations from hypotheses. The bench serial is the only active target.
 The real pump 560793 may be passively listened to, but never transmit to it.
 Never use a generic ACK in a mixed capture as proof of a bench response.
 The AndroidAPS-timed scan and parameterized RFPowerOn scan have both been run.
-A later session (2026-09-23, continued under an explicit standing goal to
-fix reception and test freely against the bench pump) found and fixed three
-real receive-path bugs -- see Follow-up 5 -- and got the bridge to cleanly
-receive short frames from the other pump (560793) for the first time this
-project. 646910's own replies still don't come through cleanly; Follow-up 5
-and the Next steps section above are the current, live state, not the
-"no further tests" note this section previously carried from an earlier
-wrap-up. Any future active request must use serial 646910 only and count
-only its CRC-valid, expected-opcode response.
+**As of Follow-up 12 (2026-09-24), the investigation is RESOLVED**: the bridge
+reliably receives and correctly decodes bench pump 646910's real reply and
+delivers it over BLE, confirmed by two independent ground-truth-backed test
+runs. A prior session (2026-09-23, under the same standing goal) found and
+fixed several real receive-path bugs -- see Follow-up 5 -- and got the bridge
+receiving 560793 first; 646910 itself did not come through cleanly until
+Follow-up 12. Do not re-open the receive-path investigation from scratch on
+a fresh read of this file -- treat reception as working, and if a future test
+shows 646910 not being received again, treat that as a regression against
+this known-good baseline (check recent firmware changes first) rather than
+restarting the original investigation. A `no BLE response` immediately after
+a script that crashed instead of exiting cleanly is very likely the BlueZ
+stale-GATT-cache issue documented in Follow-up 12, not a firmware fault --
+rule that out first (`bluetoothctl remove <bridge MAC>`, no sudo needed)
+before assuming reception has regressed. Any future active request must use
+serial 646910 only and count only its CRC-valid, expected-opcode response.

@@ -149,6 +149,14 @@ static volatile bool s_abort_flag;
  * (task context). Cleared at the start of each call.
  */
 static volatile sl_rail_events_t s_rx_error_events;
+/* RSSI captured in the ISR at the exact moment an RX error/timing event
+ * fires -- see sl_rail_util_on_event()'s own comment on why this exists
+ * separately from the end-of-slice s_last_rssi_dbm read. INT16_MIN is the
+ * "never set this iteration" sentinel (distinct from RAIL's own
+ * SL_RAIL_RSSI_INVALID, which is a valid observed reading of -128 dBm and
+ * must not be confused with "no error event happened").
+ */
+static volatile int16_t s_rx_error_rssi_dbm = INT16_MIN;
 static int16_t s_last_rssi_dbm = INT16_MIN;
 static uint16_t s_rx_pkt_count;
 static uint16_t s_tx_pkt_count;
@@ -286,6 +294,49 @@ void sl_rail_util_on_event(sl_rail_handle_t handle, sl_rail_events_t events)
 	 */
 	if (events & (SL_RAIL_EVENT_RX_PACKET_ABORTED | SL_RAIL_EVENT_RX_FRAME_ERROR
 		      | SL_RAIL_EVENT_RX_FIFO_OVERFLOW | SL_RAIL_EVENT_RX_TIMING_LOST)) {
+		/*
+		 * RSSI-at-error-time, added while implementing the RSSI/carrier-
+		 * sense work flagged as the next step in DEBUGGING_NOTES_2026-09-23.md
+		 * (Follow-up 10/11). The existing s_last_rssi_dbm read in
+		 * sl_subg_get_pkt() happens once, at the end of a whole
+		 * SL_SUBG_RX_REARM_MS (300 ms) slice -- for 646910, whose failures
+		 * never leave s_rx_count > 0, the grace-period extension never
+		 * triggers, so that end-of-slice read is separated from the actual
+		 * moment RX_TIMING_LOST fired by however much of the slice was
+		 * still left. That gap matters here specifically: the open
+		 * question from Follow-up 11 is whether 646910's reply is reaching
+		 * the receiver at a real, above-noise-floor level and failing to
+		 * demodulate (RAIL achieving timing lock at all is itself evidence
+		 * of a real signal, not pure noise) versus never getting there in
+		 * the first place -- and the noise floor drifts across a listen
+		 * window, so only a reading taken at the actual event moment is
+		 * usable as evidence either way. sl_rail_get_rssi(..., NO_WAIT) is
+		 * a non-blocking register read with no averaging wait, which is
+		 * the documented condition for it being safe to call from event-
+		 * callback/ISR context (the same call this file already makes
+		 * from task context elsewhere) -- and the radio is still in or
+		 * just leaving RX here, before sl_subg_get_pkt()'s own
+		 * sl_rail_idle() call, so this is the last point this value is
+		 * even meaningful (afterward it would read SL_RAIL_RSSI_INVALID
+		 * for the same reason the pre-existing end-of-call read had to be
+		 * moved earlier in this same investigation). Only the first error
+		 * event this iteration is kept -- once RX_TIMING_LOST fires the
+		 * reception is already lost, and a later event's RSSI would no
+		 * longer reflect the moment lock broke.
+		 */
+		if (s_rx_error_rssi_dbm == INT16_MIN) {
+			/* Same quarter-dBm-to-dBm conversion as the existing
+			 * end-of-slice read below; not special-casing
+			 * SL_RAIL_RSSI_INVALID here the way that comment discusses --
+			 * the radio is still in/leaving RX at this exact point (unlike
+			 * the idle-after-read bug that motivated tracking it there),
+			 * so seeing it here would itself be a meaningful, reportable
+			 * anomaly rather than the expected case.
+			 */
+			int16_t rssi = sl_rail_get_rssi(handle, SL_RAIL_GET_RSSI_NO_WAIT);
+
+			s_rx_error_rssi_dbm = (int16_t)(rssi / 4);
+		}
 		s_rx_error_events |= events & (SL_RAIL_EVENT_RX_PACKET_ABORTED
 						| SL_RAIL_EVENT_RX_FRAME_ERROR
 						| SL_RAIL_EVENT_RX_FIFO_OVERFLOW
@@ -621,6 +672,7 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 		s_rx_count = 0;
 		s_rx_have_data = false;
 		s_rx_error_events = 0;
+		s_rx_error_rssi_dbm = INT16_MIN;
 
 		/* Clear stale bits from a previous iteration/call before arming --
 		 * mirrors subg_get_pkt()'s k_sem_reset(&dio1_sem) "clear any edge
@@ -799,10 +851,22 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 			 * for dBm) per sl_rail_get_rssi()'s own documented units.
 			 */
 			if (s_rx_error_events != 0 || s_rx_count != 0) {
+				/* error_rssi is the RSSI the ISR captured at the moment
+				 * the first RX error/timing event fired this iteration
+				 * (see sl_rail_util_on_event()'s own comment) -- distinct
+				 * from end-of-slice rssi above, and the more meaningful
+				 * of the two for a zero-byte failure, since those never
+				 * extend the grace period and so leave a wide gap between
+				 * the event and the end-of-slice read. INT16_MIN means no
+				 * error event fired this iteration (e.g. s_rx_count != 0
+				 * from a clean receive, no error path taken at all).
+				 */
 				printf("radio: RX re-arm %u ended with %u B captured, "
-				       "error events 0x%016llx, rssi %d (%d dBm)\r\n",
+				       "error events 0x%016llx, rssi %d (%d dBm), "
+				       "error-time rssi %d dBm\r\n",
 				       rearm_count, s_rx_count,
-				       (unsigned long long)s_rx_error_events, rssi, rssi / 4);
+				       (unsigned long long)s_rx_error_events, rssi, rssi / 4,
+				       (int)s_rx_error_rssi_dbm);
 			} else if ((rearm_count % 20U) == 1U) {
 				/* Sparse baseline sample -- every 20th empty re-arm
 				 * (roughly every 6 s at the 300 ms interval), not

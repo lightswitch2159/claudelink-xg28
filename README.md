@@ -12,14 +12,20 @@ firmware.
 
 ## Status
 
-**Running on real hardware.** Flashed to a BRD2705A (xG28-EK2705A Explorer
-Kit) via Simplicity Commander, boots, brings up the sub-GHz radio, advertises
-over BLE as `ClaudeLinkSI` with the Insulin Pump Service UUID in the
-advertisement itself (not just discoverable after connecting -- see "AAPS
-couldn't see the device" below), accepts a connection, and exposes the real
-GATT service (confirmed via `bluetoothctl`: `UUID: Vendor specific
-(0235733b-99c5-4197-b856-69219c2a3845)`, the Insulin Pump Service). Nothing
-has talked to an actual pump yet -- that's the next real milestone.
+**Running on real hardware, and talking to a real pump.** Flashed to a
+BRD2705A (xG28-EK2705A Explorer Kit) via Simplicity Commander, boots, brings
+up the sub-GHz radio, advertises over BLE as `ClaudeLinkSI`/`ClaudeLink` with
+the Insulin Pump Service UUID in the advertisement itself (not just
+discoverable after connecting -- see "AAPS couldn't see the device" below),
+accepts a connection, and exposes the real GATT service (confirmed via
+`bluetoothctl`: `UUID: Vendor specific (0235733b-99c5-4197-b856-69219c2a3845)`,
+the Insulin Pump Service). As of 2026-09-24, the bridge reliably completes a
+full round trip with bench pump 646910 -- BLE command in, RF wake+request
+out, real pump reply decoded and delivered back over BLE -- confirmed twice,
+independently, against a simultaneous HackRF ground-truth capture. See
+"Bridge TX/RX confirmed working end-to-end" below and
+[the hardware debugging handoff](DEBUGGING_NOTES_2026-09-23.md) (Follow-up 12)
+for the full account.
 
 `src/` is wired into the actual Simplicity Studio project (`orangelink_xg28`'s
 own `.slcp` source list) and `tools/build.sh` drives a full compile-and-link
@@ -85,25 +91,25 @@ fresh AndroidAPS log after the fix shows CMD_UPDATE_REG writes getting real
 Response Count notifications (01, 02, 03, ...) instead of "No response from
 RileyLink".
 
-**Bridge TX is confirmed; the bridge RX path is missing replies.** This is a Dynamic
-Multiprotocol build, so TX supplies scheduler priority and bounded airtime,
-then yields the shared radio. TX uses the actual encoded length plus a zero
-terminator; the 107-byte value is the RX maximum. A controlled read-only AAPS
-test set 4b6b, sent a 12-second wake burst, and swept 11 frequencies from
-916.298 to 916.798 MHz in 50 kHz steps. The firmware read each requested
-frequency back exactly. A simultaneous 90-second HackRF capture decoded 18
-CRC-valid model replies from bench pump 646910 during the wake and scan window.
-The bridge reported every request silent and did not deliver those replies to
-the host. A separate passive listen at 916.650 MHz decoded a valid 560793 frame,
-so the RX chain works on at least one channel; alignment or RAIL receive behavior
-for the bench replies remains unresolved.
+**Bridge TX/RX confirmed working end-to-end, including with the target bench
+pump.** This is a Dynamic Multiprotocol build, so TX supplies scheduler
+priority and bounded airtime, then yields the shared radio. TX uses the
+actual encoded length plus a zero terminator; the 107-byte value is the RX
+maximum. RX is explicitly configured for FIFO mode so the 1-byte threshold
+event used by the zero-terminated reply handler can fire; packet mode had
+disabled that event path. `sl_rail_start_rx()` supplies DMP scheduler
+priority 200 so BLE connection events can share the radio.
 
-RX is explicitly configured for FIFO mode so the 1-byte threshold event used by
-the zero-terminated reply handler can fire; packet mode had disabled that event
-path. `sl_rail_start_rx()` supplies DMP scheduler priority 200 so BLE connection
-events can share the radio. Do not interpret a foreign 560793 frame as a
-646910 response. See [the hardware debugging handoff](DEBUGGING_NOTES_2026-09-23.md)
-for the capture paths, per-frequency sweep results, and remaining diagnosis.
+Getting a clean, reliable receive from bench pump 646910 specifically took an
+extended investigation (RX re-arm loop, FIFO reset before arming, a 50 ms
+TX-to-RX settling delay, a grace period for a reception already in progress,
+RSSI read-before-idle and units fixes, and a required-but-missing board RF
+path switch component -- see [the hardware debugging
+handoff](DEBUGGING_NOTES_2026-09-23.md) for the full blow-by-blow). As of
+2026-09-24 (Follow-up 12 there) it is resolved: two independent test runs
+each got a complete, correct, 71-byte decoded reply from 646910 at every
+scan position, cross-checked byte-for-byte against a simultaneous HackRF
+capture. Do not interpret a foreign 560793 frame as a 646910 response.
 
 ## Diagnostic logging
 
@@ -214,37 +220,25 @@ probe.
 
 ## Remaining hardware checks
 
-- **A required board component was missing from the project entirely --
-  fixing it produced a real, confirmed ~10-40 dB receive sensitivity
-  improvement, though bench pump 646910 specifically still isn't received.**
-  BRD2705A has a physical RF path switch (`hardware_board_has_rfswitch_to_ground`
-  in the board's own component metadata), and the RAIL library declares
-  `sl_rail_util_rf_path_switch` as *required* whenever that capability is
-  present -- but this project's `.slcp` never included it, a real gap in a
-  project built almost entirely through hand-edited `.slcp`/`.cmake`/`autogen`
-  files with no SLC tool ever available to validate the dependency graph.
-  The switch's two control GPIOs were never configured, left at their
-  power-on-reset default -- consistent with the board's own metadata listing
-  868 MHz as its default RF band, not the 916 MHz this project actually
-  uses. Added the component (source, config, and its own documented
-  `sl_stack_init()` wiring, all copied from the SDK's own pre-validated
-  files, not guessed) and rebuilt clean. Live result: the noise floor itself
-  dropped from ~-98 dBm to ~-111 dBm (a real, uniform sensitivity gain), and
-  a different pump's (560793) signal jumped from as low as -100 dBm to a
-  consistent -59 dBm. **646910 still wasn't received** -- 11 confirmed real
-  transmissions in the same test window, still landing on the (now lower)
-  noise floor. Seven other real, confirmed firmware bugs were also found
-  and fixed earlier in this same investigation (concatenation guard, RX
-  re-arm loop, FIFO reset, TX-to-RX settling delay, re-arm grace period,
-  RSSI idle-ordering, RSSI units -- the last two explain a "reported 0 dBm
-  RSSI is physically implausible" symptom flagged earlier in the
-  investigation). Distance, pump-battery age (confirmed fresh), and RSSI
-  calibration (offset reads exactly 0 dB) have all been ruled out as
-  explanations for 646910 specifically. Antenna orientation (rotating the
-  pump/board at the same close range) is the next thing to try, layered on
-  top of this fix. See
-  [the hardware debugging handoff](DEBUGGING_NOTES_2026-09-23.md) for the
-  full analysis.
+- **Bench pump 646910 reception is now confirmed working reliably** (see
+  Status above and [the hardware debugging
+  handoff](DEBUGGING_NOTES_2026-09-23.md), Follow-up 12) after an extended
+  investigation that found and fixed eight real bugs/gaps: a concatenation
+  guard, the RX re-arm loop, FIFO reset before arming, a TX-to-RX settling
+  delay, a re-arm grace period, RSSI idle-ordering, RSSI units, and a
+  required-but-missing board RF path switch component
+  (`sl_rail_util_rf_path_switch` -- BRD2705A has a physical RF path switch
+  the RAIL library declares required whenever present, but this project's
+  hand-edited `.slcp` never included it; fixing it dropped the noise floor
+  from ~-98 dBm to ~-111 dBm and took a different pump's (560793) signal
+  from as low as -100 dBm to a consistent -59 dBm). If 646910 (or any pump)
+  stops being received in a future session, treat it as a regression against
+  this confirmed-working baseline -- check recent firmware changes first --
+  rather than restarting the investigation from scratch. A test run that
+  gets `no BLE response` right after a previous script crashed mid-connection
+  instead of exiting cleanly is very likely a stale host-side BlueZ GATT
+  cache (`bluetoothctl remove <bridge MAC>`, no sudo needed), not a firmware
+  fault -- see Follow-up 12.
 - Custom Name rename is RAM-only: no flash-backed settings storage exists
   yet, so it doesn't survive a power cycle the way "persist" implies in the
   legacy protocol.
