@@ -229,15 +229,25 @@ probe.
   turnaround transient had no time to decay -- a 50 ms delay eliminated it
   completely, immediately producing clean, complete, correctly-terminated
   receptions of a different pump's short frames, repeatedly, for the first
-  time this project. 646910's own replies -- long, and structurally full of
-  interior zero-padding -- still don't come through cleanly even with all
-  three fixes active; a live test with every fix in place still caught a
-  correctly-decoded 646910 header and model text with a second pump's frame
-  concatenated onto the end. Carrier mismatch, signal strength, and DMP
-  scheduler preemption were separately ruled out earlier and are likely moot
-  now that real, confirmed reception bugs were found. See
-  [the hardware debugging handoff](DEBUGGING_NOTES_2026-09-23.md) for the
-  full analysis and current hypotheses.
+  time this project. 646910's own replies still don't come through cleanly
+  even with all three fixes active, and a fourth fix (a grace period so a
+  reply starting late in a re-arm slice isn't cut off mid-frame) made this
+  more precise rather than fixing it: with more time to capture, the buffer
+  fills with *multiple* concatenated fragments (646910's real header, then
+  more than one unrelated frame after it), not just one. Checked and ruled
+  out interior zero-value bytes confusing the raw-byte terminator scan (the
+  4b6b line coding mathematically cannot produce a raw 0x00 from encoded
+  data, confirmed against the working short-frame receptions, which also
+  decode to include a zero byte). Current understanding: 646910's own reply
+  may never produce a clean, demodulated end-of-transmission signal on this
+  radio (EFR32/RAIL) the way it apparently does on the RFM69 chip the
+  original zero-terminator convention was designed around -- the fix is
+  likely RSSI/carrier-sense based termination rather than another retiming
+  attempt, not yet implemented (needs a real noise-floor measurement on
+  this setup first, not a guessed threshold). Carrier mismatch, signal
+  strength, and DMP scheduler preemption were separately ruled out earlier.
+  See [the hardware debugging handoff](DEBUGGING_NOTES_2026-09-23.md) for
+  the full analysis and current hypotheses.
 - Custom Name rename is RAM-only: no flash-backed settings storage exists
   yet, so it doesn't survive a power cycle the way "persist" implies in the
   legacy protocol.

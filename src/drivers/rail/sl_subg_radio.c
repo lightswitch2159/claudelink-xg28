@@ -97,6 +97,13 @@ static sl_rail_handle_t s_rail_handle;
  * many fresh listen attempts within a typical AndroidAPS wake/scan window.
  */
 #define SL_SUBG_RX_REARM_MS           300U
+/* Grace period granted to an in-progress reception (bytes already
+ * arriving, no terminator yet) when the re-arm timer above expires before
+ * it finishes -- see sl_subg_get_pkt()'s own comment for why. Comfortably
+ * longer than one full max-length frame (~62 ms) past whatever portion of
+ * the 300 ms slice was already spent waiting.
+ */
+#define SL_SUBG_RX_GRACE_MS           150U
 
 static OS_FLAG_GRP s_event_flags;
 
@@ -648,6 +655,56 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 				  OS_OPT_PEND_FLAG_SET_ANY | OS_OPT_PEND_BLOCKING,
 				  NULL, &err);
 		(void)bits;
+
+		/*
+		 * REAL BUG IN THIS SESSION'S OWN RE-ARM FIX, CAUGHT ON LIVE
+		 * HARDWARE: a live test with every other fix in this function
+		 * active still caught nothing at all from 646910 across ~16
+		 * confirmed, HackRF-verified transmissions with zero contending
+		 * traffic from any other pump in the same window -- ruling out
+		 * cross-pump interference as the sole explanation and pointing
+		 * back at this loop's own fixed SL_SUBG_RX_REARM_MS boundary.
+		 * A real reply only takes ~62 ms on air, comfortably inside one
+		 * 300 ms slice -- but only if it starts early enough in the
+		 * slice. The pump's own reply timing is not synchronized to our
+		 * re-arm schedule, so a reply starting late in a slice was being
+		 * force-idled by sl_rail_idle() below the instant this wait
+		 * timed out, mid-reception, discarding real bytes already in
+		 * s_rx_buf instead of letting that specific reception finish.
+		 * If the wait above genuinely timed out (not a real completion
+		 * or abort) but bytes have already started arriving, give this
+		 * specific reception a bounded grace period to finish before
+		 * idling -- covers a reply that started anywhere in the slice
+		 * without giving a truly stuck reception (the ~30-36 B signature
+		 * from earlier in this investigation) more than its own fair
+		 * share of extra time.
+		 */
+		if (RTOS_ERR_CODE_GET(err) == RTOS_ERR_TIMEOUT && s_rx_count > 0) {
+			OS_TICK grace_deadline;
+
+			err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+			grace_deadline = OSTimeGet(&err) + ms_to_ticks(SL_SUBG_RX_GRACE_MS);
+
+			for (;;) {
+				OS_TICK grace_now, grace_wait;
+
+				err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+				grace_now = OSTimeGet(&err);
+				if (grace_now >= grace_deadline) {
+					break;
+				}
+				grace_wait = grace_deadline - grace_now;
+
+				err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+				(void)OSFlagPend(&s_event_flags, SL_SUBG_EVT_RX_DATA | SL_SUBG_EVT_ABORT,
+						 grace_wait,
+						 OS_OPT_PEND_FLAG_SET_ANY | OS_OPT_PEND_BLOCKING,
+						 NULL, &err);
+				if (RTOS_ERR_CODE_GET(err) == RTOS_ERR_NONE) {
+					break;
+				}
+			}
+		}
 
 		(void)sl_rail_idle(s_rail_handle, SL_RAIL_IDLE, true);
 		rearm_count++;

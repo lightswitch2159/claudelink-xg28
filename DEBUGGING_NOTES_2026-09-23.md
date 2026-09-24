@@ -575,33 +575,93 @@ completely or cleanly. Two live hypotheses, not yet distinguished:
     end -- consistent with 560793 being an unusually active, frequently-
     transmitting neighbor throughout every capture this whole session.
 
+## Follow-up 6: zero-value interior bytes ruled out; likely a real demodulator
+difference from the RFM69 reference
+
+Checked the concern directly: does 4b6b-encoded padding (decoded zero
+bytes, which a 71 B model reply is mostly made of) ever produce a raw 0x00
+byte on the wire, which would trip the terminator scan early? Traced the
+bit-packing in `encode_4b6b()` (`src/encoding/4b6b.c`) by hand: none of the
+16 6-bit symbols is zero, and every symbol's own low 4 bits are non-zero
+too, so none of the three raw bytes produced by encoding any nibble pair
+can ever be 0x00, regardless of the decoded value (including runs of
+zeros). Confirmed empirically too: 560793's own short reply decodes to
+`a7 56 07 93 8d 00 93` -- a genuine interior zero byte -- and this exact
+frame is now received cleanly and repeatedly. Interior zero-value padding
+is not the mechanism.
+
+Suspecting my own re-arm loop's fixed 300 ms boundary could be chopping an
+otherwise-successful reception that simply started late in a slice (a real
+reply only takes ~62 ms on air, comfortably inside 300 ms, but only if it
+starts early enough), added a bounded grace period: if the wait times out
+but bytes have already started arriving (`s_rx_count > 0`), wait up to a
+further 150 ms before idling, instead of force-cutting the reception
+exactly when the fixed timer expires.
+
+Result, live against the bench pump: this captured substantially more data
+per attempt (order 70+ B, up from ~30-36 B) but did **not** produce a clean
+646910 reception -- instead it revealed the buffer accumulating *multiple*
+concatenated fragments: 646910's real header/model text, then a full
+560793 frame, then *another* 560793 fragment, all in one buffer. Cross-pump
+interference was already ruled out as the *sole* explanation in Follow-up
+5 (646910 transmitted ~16 times with zero contending traffic in one run
+and was still never caught at all), so extending the window doesn't fix
+646910's reply -- it just gives more time for whatever unrelated traffic is
+on the channel to bleed in before anything makes the reception stop.
+
+This points at something more fundamental than any timing parameter tried
+so far: **646910's own reply may never be producing a genuine, cleanly-
+demodulated raw 0x00 terminator byte on this radio**, unlike 560793's short
+replies, which terminate correctly and repeatably. The zero-terminator
+convention is inherited from the legacy RFM69-based firmware, where it
+demonstrably works in production against real pumps -- but RFM69 and RAIL
+(EFR32's native radio) are different demodulator ICs, and RAIL's specific
+behavior once the pump's real over-the-air signal genuinely ends (vs. the
+RFM69's) is untested and unconfirmed here. If RAIL simply keeps outputting
+whatever is next on the channel once the real signal stops, rather than
+producing a clean 0x00 the way RFM69 apparently does, no amount of
+retiming can fix this -- the receiver needs an independent way to know the
+real transmission ended, most likely RSSI/carrier-sense based (poll RSSI
+during an in-progress reception; a genuine drop to the noise floor means
+the pump stopped transmitting, regardless of what byte value shows up
+next). Not implemented this session: a real, safe squelch threshold needs
+to be calibrated against this setup's actual noise floor first, which
+needs its own dedicated measurement, not a guessed constant.
+
+`sl_rail_types.h` does define `SL_RAIL_EVENT_RX_TIMING_LOST`, which might
+be a cheaper, RAIL-native alternative to a hand-rolled RSSI poll -- looked
+at, but its own SDK doc comment carries only a terse warning with no
+detail on when it reliably fires; enabling and logging it (same pattern as
+the three RX error events added in Follow-up 5) would be the next low-cost
+thing to try before committing to a full RSSI-polling redesign.
+
 ## Next steps
 
-1. **Distinguish the two live hypotheses from Follow-up 5.** Check whether
-   the 4b6b symbol table genuinely guarantees no valid encoded byte equals
-   raw 0x00 on the RX side the way it's relied on for TX -- if that holds,
-   the zero-terminator convention is not the bug, and the fault is RAIL not
-   separating distinct over-the-air transmissions within one fixed-length
-   receive session. If it doesn't hold, the terminator scan itself needs to
-   change (e.g. require N consecutive zero bytes, or switch to a real
-   length-based framing instead of sentinel scanning).
-2. If RAIL genuinely can't separate transmissions within one session: the
-   fix is likely to shorten `sl_rail_start_rx()` sessions further (the
-   current 300 ms re-arm interval may still be too coarse against 560793's
-   observed ~1.4-2.5 s transmission cadence) or to add RSSI/carrier-sense
-   based gap detection so a real inter-transmission silence, not just a
-   raw byte value, is what ends a reception.
-3. Re-test specifically for 646910 with all four fixes from Follow-up 5 in
-   place (guard against post-terminator appending, periodic re-arm, FIFO
-   reset before arming, 50 ms settling delay) and a concurrent HackRF
-   capture, focused on getting a single, clean, uncontaminated capture
-   window (e.g. immediately after confirming via a passive listen that
-   560793 is currently quiet) to remove it as a confound while testing
-   646910 specifically.
+1. **Enable and log `SL_RAIL_EVENT_RX_TIMING_LOST`** alongside the existing
+   three RX error events in `sl_subg_radio.c` (same pattern: record in the
+   ISR into `s_rx_error_events`, print from task context in
+   `sl_subg_get_pkt()`). Cheap, no design changes, and would show directly
+   whether RAIL itself ever recognizes 646910's transmission ending, even
+   if our own byte-scanning doesn't act on it correctly.
+2. **The real fix is very likely RSSI/carrier-sense based termination**,
+   not another timing/retry parameter -- Follow-up 6 ruled out interior
+   zero-value bytes, and Follow-up 5+6 together show more time/retries just
+   captures more unrelated traffic rather than fixing 646910's reply
+   specifically. Needs: (a) a real noise-floor RSSI measurement on this
+   exact setup (frequency, antenna, environment) to pick a safe squelch
+   threshold -- do not guess a constant; (b) a way to poll RSSI during an
+   in-progress reception (task context, so likely inside the grace-period
+   loop added in Follow-up 6) and treat a sustained drop to the floor as
+   "transmission ended, stop and process whatever's in the buffer" instead
+   of continuing to drain whatever comes next.
+3. Once RSSI-based termination exists, re-test specifically for 646910 with
+   a concurrent HackRF capture, ideally during a window confirmed quiet for
+   560793 first (a quick passive listen) to remove it as a confound while
+   testing 646910 specifically.
 4. The carrier-mismatch hypothesis (916.6968 MHz measured, 71.8 kHz from the
-   916.625 MHz nominal) is likely moot now that Follow-up 5 found real,
-   confirmed reception bugs independent of frequency -- deprioritize unless
-   items 1-3 above are exhausted without a fix.
+   916.625 MHz nominal) and the frame-length hypothesis (retracted in
+   Follow-up 4) are both likely moot now -- deprioritize unless items 1-3
+   above are exhausted without a fix.
 5. The RX error-event instrumentation (`s_rx_error_events` in
    `sl_subg_radio.c`) has stayed clean on every single run all session (no
    aborts/errors) -- keep watching, but it has not yet pointed at anything.
