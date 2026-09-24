@@ -393,31 +393,145 @@ receiver may simply be parked tens of kHz outside 646910's actual carrier,
 outside the OOK channel filter -- while 560793 happens to land close enough
 to be heard.
 
+## Follow-up 3: precise carrier calibration, and a test-methodology confound
+
+Measured 646910's real reply carrier directly from `bench_646910_extended_wake_20260923.cs8`'s
+~20 confirmed-reply timestamps: an FFT peak (Hann-windowed, 60 ms window per
+reply, `CENTER_HZ=916,100,000`, `FS=2,000,000`) at each timestamp gives:
+
+```
+n=22  mean=916.696753 MHz  median=916.696767 MHz  std=48.1 Hz
+```
+
+This is precise and consistent (48 Hz std across 22 independent
+measurements spanning ~40 s -- the small upward drift over that span is
+consistent with pump-oscillator warm-up, not measurement noise). **646910's
+real reply carrier is 916.6968 MHz**, 71.8 kHz from the bridge's 916.625 MHz
+wake-stage tuning.
+
+Three live follow-up tests, all against bench 646910 with concurrent HackRF
+capture:
+
+1. Single command, `--centre 916.6968` (both wake TX and stage-2 scan
+   tuned near the calibrated carrier, span 0.01/step 0.005): only foreign
+   560793 frames were heard, at nearly every frequency tried -- no 646910
+   reply reported by the probe. **Checked against the capture independently:
+   `debug-evidence/captures/bench_646910_calibrated_carrier_test_20260923.cs8`
+   contains 3 CRC-valid 646910 model replies (t=14.41, 15.86, 19.56 s) during
+   this exact run.** This is the clean, uncontaminated test: wake and listen
+   both tuned within ~3 kHz of the pump's own precisely-measured carrier,
+   the pump demonstrably replied three times during the window, and the
+   bridge still caught none of them while catching foreign 560793 frames
+   repeatedly in the same run. **This weakens the simple carrier-mismatch
+   hypothesis** -- tuning to the measured true frequency did not recover
+   reception on its own.
+2. Two-step: full wake at the known-working 916.625 MHz, then immediately
+   `--listen-only --listen-freq-mhz 916.6968`. Capture decode shows 646910
+   replied only briefly during step 1 itself (t=9.6-15.1 s, i.e. while still
+   tuned to 916.625 -- necessarily missed) and had gone quiet again before
+   step 2 (a separate BLE session, several seconds of reconnect overhead)
+   started listening.
+3. Same two-step shape with a full 25 s wake-listen at 916.625 (matching the
+   parameters that produced ~20 replies over ~40 s in the extended-window
+   test) followed by `--listen-only --listen-freq-mhz 916.6968` for 40 s.
+   Capture decode shows only 3 replies this time (t=9.4, 35.2, 36.5 s) --
+   both a shorter and sparser awake window than the extended-window test's
+   ~20 replies over ~40 s -- and step 2's listen (starting only after step
+   1's full ~30-36 s wake+scan completed, plus BLE reconnect) began after
+   the last confirmed reply at t=36.5 s. No overlap between "calibrated
+   listen active" and "pump replying" was achieved in either two-step test.
+
+**This does not disprove the carrier-mismatch hypothesis** -- it shows the
+two-command test methodology (wake and calibrated-listen as separate BLE
+sessions) cannot currently produce a fair, overlapping test, because
+issuing the second command costs enough wall-clock time that the pump's own
+awake window (itself variable, observed anywhere from ~6 s to ~40 s of
+active replying) has usually already closed.
+
+**Checked against the capture independently (costs no further pump RF
+exposure): test 1 (single command, wake and listen both tuned within ~3 kHz
+of the measured true carrier) has 646910 replying 3 times during the run
+(t=14.41, 15.86, 19.56 s), and the bridge caught none of them.** This is a
+clean, uncontaminated result -- not confounded by the two-session gap that
+affects tests 2 and 3 -- and it weakens the simple carrier-mismatch
+hypothesis: tuning within 3 kHz of the pump's own measured carrier did not
+recover reception on its own.
+
+## Follow-up 4: signal strength ruled out; frame length is the new lead
+
+Compared raw HackRF amplitude (peak/RMS, dBFS) at 646910's three confirmed
+reply timestamps against five of 560793's confirmed frame timestamps, all
+within the same capture (`bench_646910_calibrated_carrier_test_20260923.cs8`,
+so identical gain/antenna/distance conditions for both). 646910's
+transmissions measure -5.7 to -7.6 dBFS RMS, comparable to or *stronger
+than* several of 560793's measurements (-16.6 to -0.5 dBFS RMS, quite
+variable). **646910's signal is not weaker** -- rules out a simple
+sensitivity/RSSI explanation.
+
+Re-examined what the bridge has actually, confirmedly received all session:
+every "FOREIGN FRAME serial=560793" the bridge reported catching (multiple
+times, across several tests today) corresponds to the *same short 7-byte*
+560793 frame (`a75607938d0093`, op=0x8d, confirmed against the capture's own
+decode: `t=20.8884s serial=560793 op=0x8d len=7`). 560793 also transmitted
+many long (67-71 byte) frames in the very same capture window (0x06 ACKs are
+short, but 0x80 data frames are long) -- none of those were ever reported
+caught by the bridge either. **Across every test run this session, the
+bridge has never once been confirmed to receive a long frame (the ~71-byte
+decoded / ~107-byte encoded class that 646910's model reply belongs to)
+from *either* pump -- only short (7-byte) frames, and only from 560793.**
+
+This is a better unifying explanation than carrier mismatch: it accounts for
+646910 never being received (its only relevant reply is long) without
+requiring any pump-to-pump difference in signal strength or carrier
+accuracy. It also lines up with a real asymmetry already visible in
+`sl_subg_radio.c`: TX explicitly overrides the frame length per-transmission
+with `sl_rail_set_fixed_length()` (`tx_frame_len = len + 1`, reset to
+`SL_RAIL_SET_FIXED_LENGTH_INVALID` after), but RX never calls
+`sl_rail_set_fixed_length()` at all -- it always runs against whatever the
+Radio Configurator's own default fixed length is (107 bytes, the documented
+RX ceiling). Not yet confirmed as the actual defect; recorded here as the
+leading, concrete, testable hypothesis.
+
 ## Next steps
 
-1. Determine 646910's real reply carrier precisely. The existing capture
-   `bench_646910_extended_wake_20260923.cs8` already contains ~20 confirmed
-   646910 replies with known timestamps -- an FFT/carrier measurement at
-   those specific timestamps (same method already used for the TX offset
-   table in "Facts established" above) would give a calibrated number
-   instead of the current uncalibrated ~916.670-916.694 MHz estimate.
-2. Test listening with `--listen-only --listen-freq-mhz <that frequency>`
-   against 646910 specifically (the tool's existing receive-only path,
-   already proven against 560793 earlier in this file) to confirm reception
-   recovers when tuned to the pump's actual carrier rather than the nominal
-   916.625 MHz.
-3. If that confirms it, the real fix is almost certainly in `sl_subg_set_freq()`
-   / the RX side of `sl_subg_radio.c`: either the ~20.6 kHz TX offset also
-   applies to RX and needs compensating, or RX and TX need to be tuned
-   independently rather than sharing one channel-config path.
-4. The DMP RX-error-event instrumentation added this session
+1. **Zero-RF-cost check first:** confirm directly whether short vs. long is
+   really the dividing line by checking `sl_rail_config_rx_data()`'s
+   parameters and the RX fixed-length/FIFO-threshold interaction in
+   `sl_subg_radio.c` against the RAIL SDK docs -- specifically whether a
+   107-byte fixed-length RX configured for FIFO mode with a 1-byte threshold
+   has any known failure mode for longer receptions (e.g. FIFO wrap,
+   threshold re-arming, buffer overflow past `SL_SUBG_FIFO_BYTES` = 128).
+2. **Low-RF-cost live check:** a passive `--listen-only` session at a
+   frequency/time known to carry one of 560793's own *long* frames (0x80
+   data, confirmed present in existing captures) would test the
+   short-vs-long hypothesis without needing the bench pump to cooperate at
+   all -- 560793 already appears to be in active, ongoing communication with
+   another system, producing long frames on its own schedule. Tried once
+   this session (`passive_560793_longframe_check_20260923.cs8`, 45 s,
+   916.6968 MHz, no TX at all): only 12 bursts total, none reaching the
+   20-byte threshold -- 560793 simply didn't transmit a long frame during
+   this particular window. Inconclusive, not a negative result; worth
+   retrying, ideally over a longer window or with the capture centred to
+   also cover the other frequencies 560793 has been heard at.
+3. If confirmed, the fix is almost certainly on the RX side of
+   `sl_subg_radio.c`: give RX an explicit fixed-length override (mirroring
+   TX's own per-call `sl_rail_set_fixed_length()`), or investigate why the
+   FIFO-mode 1-byte-threshold drain loop might not reliably keep up with or
+   terminate correctly on a full ~107-byte reception.
+4. The carrier-mismatch hypothesis (916.6968 MHz measured, 71.8 kHz from the
+   916.625 MHz nominal) is not fully closed -- it may still be a secondary
+   contributing factor -- but is no longer the leading explanation given
+   Follow-up 3's uncontaminated negative test at the calibrated frequency.
+5. Minimize further live bench-pump wake cycles until the frame-length
+   hypothesis is checked -- five wake cycles were already run this session.
+6. The DMP RX-error-event instrumentation added this session
    (`s_rx_error_events` in `sl_subg_radio.c`) should stay in place regardless
-   -- it produced a clean negative result on both runs (no aborts/errors),
-   which is itself evidence, and costs nothing to keep watching on future
-   tests.
-5. Preserve the foreign-frame filter. Only a valid-CRC frame with serial
+   -- it produced a clean negative result on every run this session (no
+   aborts/errors), which is itself evidence, and costs nothing to keep
+   watching on future tests.
+7. Preserve the foreign-frame filter. Only a valid-CRC frame with serial
    646910 counts as a bench response.
-6. Large `.cs8` captures stay in the local `debug-evidence/captures/` directory
+8. Large `.cs8` captures stay in the local `debug-evidence/captures/` directory
    and are excluded from Git by `.gitignore`; never use `/tmp`.
 
 Suggested active command (use this interpreter path, BLE device, and bench
