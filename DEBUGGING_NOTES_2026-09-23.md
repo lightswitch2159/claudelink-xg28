@@ -353,23 +353,71 @@ simply wrong for this specific bench unit, or something about this bridge's
 own TX burst adds delay before the pump considers itself woken, is not yet
 established.
 
+## Follow-up 2: extended window rules out timing, points at frequency
+
+The previous follow-up's hypothesis (fixed 25 s window too short) was tested
+directly: re-ran the same probe against bench pump 646910 with
+`--wake-timeout-ms 60000` (60 s, well past the ~26 s delay observed
+previously) and a concurrent HackRF capture
+(`debug-evidence/captures/bench_646910_extended_wake_20260923.cs8`, 120 s).
+
+Offline decode is conclusive, and rules the timing hypothesis out:
+
+- Wake burst finishes transmitting by ~t=18.25 s.
+- Bench pump 646910 replies at **t=18.42 s** -- about 200 ms later, not 26 s
+  this time -- and keeps replying steadily (roughly every 1.4-2.2 s) through
+  t=57.9 s. All ~20 replies fall comfortably inside the 60 s listen window
+  (open until ~t=78.25 s).
+- The bridge caught **none** of them. The probe's stage-1 report was a single
+  `FOREIGN FRAME serial=560793`; every one of 646910's ~20 replies during
+  the window went undetected.
+- A garbled 3-byte partial decode of a 560793 frame also appeared during the
+  stage-2 scan (916.450 MHz, try 3/3) -- consistent with marginal reception
+  of that other pump, not of 646910.
+
+This also confirms the earlier ~56 s delay was run-to-run pump-wake
+variability (cold vs. already-addressed pump), not a systematic bridge
+timing defect -- resolving the open question from Follow-up 1.
+
+With a 60 s window and ~20 real in-window replies still producing zero
+detections, while a foreign pump's transmissions were heard twice in the
+same runs, the fault is not receive duration or DMP scheduling. The
+remaining, well-supported lead is **frequency/channel misalignment specific
+to 646910's actual reply carrier**: earlier uncalibrated HackRF estimates
+put that carrier around 916.670-916.694 MHz, while the bridge was tuned to
+916.625 MHz (stage 1) and only briefly dwells at 916.650/916.700 MHz during
+stage 2 (3.75 s each per ~30 s cycle). Combined with the ~20.6 kHz TX offset
+already measured (`sl_subg_set_freq()` drives both TX and RX through the
+same channel-config path, so RX likely carries the same offset), the
+receiver may simply be parked tens of kHz outside 646910's actual carrier,
+outside the OOK channel filter -- while 560793 happens to land close enough
+to be heard.
+
 ## Next steps
 
-1. Test with the wake-stage listen window extended well past the observed
-   ~26 s pump-wake delay (e.g. 45-60 s) against bench pump 646910 only, with
-   a simultaneous HackRF capture, to confirm the reply is captured when the
-   window is long enough. This is now the primary hypothesis to confirm or
-   rule out before touching the RX driver further.
-2. If confirmed, reconsider stage 2's dwell time and frequency step against
-   the pump's real ~1.5-2.5 s reply cadence -- 3.75 s per frequency across
-   8 frequencies may still miss it depending on alignment.
-3. The DMP RX-error-event instrumentation added this session
+1. Determine 646910's real reply carrier precisely. The existing capture
+   `bench_646910_extended_wake_20260923.cs8` already contains ~20 confirmed
+   646910 replies with known timestamps -- an FFT/carrier measurement at
+   those specific timestamps (same method already used for the TX offset
+   table in "Facts established" above) would give a calibrated number
+   instead of the current uncalibrated ~916.670-916.694 MHz estimate.
+2. Test listening with `--listen-only --listen-freq-mhz <that frequency>`
+   against 646910 specifically (the tool's existing receive-only path,
+   already proven against 560793 earlier in this file) to confirm reception
+   recovers when tuned to the pump's actual carrier rather than the nominal
+   916.625 MHz.
+3. If that confirms it, the real fix is almost certainly in `sl_subg_set_freq()`
+   / the RX side of `sl_subg_radio.c`: either the ~20.6 kHz TX offset also
+   applies to RX and needs compensating, or RX and TX need to be tuned
+   independently rather than sharing one channel-config path.
+4. The DMP RX-error-event instrumentation added this session
    (`s_rx_error_events` in `sl_subg_radio.c`) should stay in place regardless
-   -- it produced a clean negative result here (no aborts/errors), which is
-   itself evidence, and costs nothing to keep watching on future tests.
-4. Preserve the foreign-frame filter. Only a valid-CRC frame with serial
+   -- it produced a clean negative result on both runs (no aborts/errors),
+   which is itself evidence, and costs nothing to keep watching on future
+   tests.
+5. Preserve the foreign-frame filter. Only a valid-CRC frame with serial
    646910 counts as a bench response.
-5. Large `.cs8` captures stay in the local `debug-evidence/captures/` directory
+6. Large `.cs8` captures stay in the local `debug-evidence/captures/` directory
    and are excluded from Git by `.gitignore`; never use `/tmp`.
 
 Suggested active command (use this interpreter path, BLE device, and bench

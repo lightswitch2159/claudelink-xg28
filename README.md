@@ -214,18 +214,23 @@ probe.
 
 ## Remaining hardware checks
 
-- **Bridge listen window is likely too short, not the receiver.** A
-  simultaneous HackRF capture during a live bench-pump (646910) test proved
-  the RX chain itself works -- it decoded a real frame from a different pump
-  mid-scan in the same run -- but bench pump 646910 didn't start replying
-  until ~26 seconds after the wake burst finished, about a second after the
-  bridge's 25-second wake-listen window had already closed. RX error-event
-  logging (`RX_PACKET_ABORTED`/`RX_FRAME_ERROR`/`RX_FIFO_OVERFLOW`, added
-  this session) stayed clean throughout, arguing against a Dynamic
-  Multiprotocol scheduler preemption. Next step: re-test with the wake-listen
-  window extended well past the observed delay. See
+- **Bridge likely isn't tuned to the bench pump's actual reply carrier.**
+  Ruled out by direct test: a 60-second wake-listen window (well past any
+  observed pump-wake delay) still caught zero of ~20 real, CRC-valid replies
+  from bench pump 646910 during a simultaneous HackRF capture, while a
+  different pump's transmissions were heard twice in the same runs -- so
+  it's not listen duration and not a broken receiver (RX error-event logging
+  added this session, `RX_PACKET_ABORTED`/`RX_FRAME_ERROR`/`RX_FIFO_OVERFLOW`,
+  stayed clean both times, arguing against Dynamic Multiprotocol scheduler
+  preemption too). Leading lead: 646910's real reply carrier was earlier
+  estimated around 916.670-916.694 MHz (uncalibrated), while the bridge
+  tunes to 916.625 MHz for the wake stage; combined with the ~20.6 kHz TX
+  offset already measured on the same `sl_subg_set_freq()` path RX also
+  uses, the receiver may simply be parked outside the pump's actual channel.
+  Next step: calibrate the carrier from the confirmed-reply timestamps
+  already captured, then test listening there directly. See
   [the hardware debugging handoff](DEBUGGING_NOTES_2026-09-23.md) for the
-  full timing analysis.
+  full analysis.
 - Custom Name rename is RAM-only: no flash-backed settings storage exists
   yet, so it doesn't survive a power cycle the way "persist" implies in the
   legacy protocol.
