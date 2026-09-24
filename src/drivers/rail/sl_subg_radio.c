@@ -83,6 +83,20 @@ static sl_rail_handle_t s_rail_handle;
 #define SL_SUBG_PREAMBLE_SYNC_BITS    160U
 #define SL_SUBG_TX_MARGIN_US          2000U
 #define SL_SUBG_TX_SLIP_TIME_US       100000U
+/* Same formula as the TX scheduler estimate below, sized for the longest
+ * possible single reception (SL_SUBG_MAX_PKT_LEN) rather than a known TX
+ * length, since RX doesn't know the incoming frame's length in advance.
+ * See sl_subg_get_pkt()'s own comment for why this exists.
+ */
+#define SL_SUBG_RX_MARGIN_US          5000U
+/* Re-arm interval for sl_subg_get_pkt()'s listen loop -- see that function's
+ * own comment for why a single long-lived sl_rail_start_rx() call across
+ * the whole caller-supplied timeout doesn't work in practice. Longer than
+ * one full max-length frame at this bitrate (~62 ms) so a real, complete
+ * reception is never cut off mid-frame by a re-arm; short enough to give
+ * many fresh listen attempts within a typical AndroidAPS wake/scan window.
+ */
+#define SL_SUBG_RX_REARM_MS           300U
 
 static OS_FLAG_GRP s_event_flags;
 
@@ -176,7 +190,23 @@ void sl_rail_util_on_event(sl_rail_handle_t handle, sl_rail_events_t events)
 	bool rx_done = false;
 	RTOS_ERR err;
 
-	if (events & SL_RAIL_EVENT_RX_FIFO_ALMOST_FULL) {
+	/*
+	 * REAL BUG, CAUGHT ON LIVE HARDWARE, NOT A GUESS: this receive already
+	 * completed (terminator seen, or buffer full) for the current
+	 * sl_subg_get_pkt() call, but s_rx_have_data only resets at the START
+	 * of the NEXT call -- there is no guard stopping a second
+	 * RX_FIFO_ALMOST_FULL firing (e.g. a second, unrelated over-the-air
+	 * burst arriving before the task wakes up and calls sl_rail_idle())
+	 * from draining MORE bytes into s_rx_buf at the current s_rx_count,
+	 * silently appending an unrelated frame onto the end of a real one.
+	 * Confirmed exactly this: a live probe against the bench pump
+	 * (2026-09-23) received a correctly-decoded 646910 model reply
+	 * immediately followed by a second pump's frame header concatenated
+	 * onto it in the same buffer, failing the CRC check downstream. The
+	 * pump's real reply was never actually missing -- it was being
+	 * silently corrupted by trailing garbage after arrival.
+	 */
+	if ((events & SL_RAIL_EVENT_RX_FIFO_ALMOST_FULL) && !s_rx_have_data) {
 		while (s_rx_count < SL_SUBG_MAX_PKT_LEN) {
 			uint8_t byte;
 			uint16_t got = sl_rail_read_rx_fifo(handle, &byte, 1);
@@ -481,79 +511,178 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
 enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t timeout_ms)
 {
 	RTOS_ERR err;
-	OS_FLAGS bits;
 	sl_rail_status_t rail_status;
-	/* The receive is an indefinite RAIL operation, so transaction_time is
-	 * intentionally omitted. Priority 200 follows Silicon Labs' DMP example
-	 * for background RX; the scheduler can still interleave higher-priority
-	 * BLE connection events on the shared radio.
+	const bool has_deadline = (timeout_ms != 0);
+	OS_TICK deadline_tick = 0;
+	unsigned rearm_count = 0;
+	/* transaction_time sized for one full max-length frame -- fixed
+	 * alongside the re-arm loop below; kept even though the loop itself
+	 * turned out to be the real fix (see that comment), since it is
+	 * still correct guidance for the DMP scheduler and cheap to keep.
 	 */
 	const sl_rail_scheduler_info_t scheduler_info = {
 		.priority = 200,
+		.transaction_time = (((uint32_t)SL_SUBG_MAX_PKT_LEN * 8U + SL_SUBG_PREAMBLE_SYNC_BITS)
+				     * 1000000U / SL_SUBG_BITRATE_BPS)
+				    + SL_SUBG_RX_MARGIN_US,
 	};
 
-	s_rx_count = 0;
-	s_rx_have_data = false;
-	s_rx_error_events = 0;
-
-	/* Clear stale bits from a previous call before arming -- mirrors
-	 * subg_get_pkt()'s k_sem_reset(&dio1_sem) "clear any edge left over from a
-	 * previous receive." Does NOT clear ABORT: an abort requested just before
-	 * this call (e.g. while the preceding TX was still in flight) must still
-	 * cut this receive short, exactly the ordering subg.c's own comment on
-	 * NOT clearing abort_flag here depends on. aps.c's sl_subg_clear_abort()
-	 * call, immediately before dispatch, is the only place that clears it.
-	 */
-	err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
-	(void)OSFlagPost(&s_event_flags, SL_SUBG_EVT_RX_DATA, OS_OPT_POST_FLAG_CLR, &err);
-
-	rail_status = sl_rail_start_rx(s_rail_handle, s_channel, &scheduler_info);
-	if (rail_status != SL_RAIL_STATUS_NO_ERROR) {
-		printf("radio: start_rx failed (status 0x%04lx)\r\n",
-		       (unsigned long)rail_status);
-		return SL_SUBG_RX_TIMEOUT;
+	if (has_deadline) {
+		err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+		deadline_tick = OSTimeGet(&err) + ms_to_ticks(timeout_ms);
 	}
 
-	/* timeout_ms == 0 means wait indefinitely -- see ms_to_ticks() above for
-	 * why 0 maps straight through to OSFlagPend()'s own 0-means-forever
-	 * convention rather than needing a sentinel translation.
+	/*
+	 * REAL BUG, CAUGHT ON LIVE HARDWARE, NOT A GUESS: this used to be one
+	 * sl_rail_start_rx() call held open for the caller's entire timeout_ms
+	 * (transaction_time alone, tried first, changed nothing). Live probes
+	 * against the bench pump, with the RTT checkpoint below, showed the
+	 * SAME signature on every attempt regardless of frequency or timeout
+	 * length: ~30-36 B captured (a real reception, not silence -- no
+	 * SL_RAIL_EVENT_RX_* error bits set either), then nothing further for
+	 * the rest of the window, timing out with real bytes sitting in the
+	 * buffer and no terminator ever found. 30-36 B is far short of even
+	 * one max-length (107 B) frame. The behavior matches RAIL locking onto
+	 * something -- a real signal or noise crossing the OOK threshold --
+	 * and then, configured for a fixed 107 B frame with no CRC and no
+	 * other end-of-frame signal, simply sitting there still "mid-packet"
+	 * for the rest of the window instead of ever giving up and looking
+	 * for a fresh sync word. A single long-lived RX call has no chance to
+	 * recover once that happens. Periodically idling and re-arming gives
+	 * a real, complete transmission (arriving at some unpredictable
+	 * moment inside the listen window) many fresh chances to be the one
+	 * RAIL is actually looking for a sync word during, instead of
+	 * potentially just one shot that can get stuck on a false start.
 	 */
-	err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
-	bits = OSFlagPend(&s_event_flags, SL_SUBG_EVT_RX_DATA | SL_SUBG_EVT_ABORT,
-			  ms_to_ticks(timeout_ms),
-			  OS_OPT_PEND_FLAG_SET_ANY | OS_OPT_PEND_BLOCKING,
-			  NULL, &err);
-	(void)bits;
+	for (;;) {
+		OS_FLAGS bits;
+		OS_TICK wait_ticks;
 
-	(void)sl_rail_idle(s_rail_handle, SL_RAIL_IDLE, true);
+		if (has_deadline) {
+			OS_TICK now;
 
-	/* Logged here (task context, safe to printf) rather than from
-	 * sl_rail_util_on_event() (ISR context, where repeated printf during
-	 * an actual incoming packet could itself perturb the timing this is
-	 * trying to diagnose). Printed on every call, not just the first --
-	 * unlike sl_subg_send_pkt()'s 200+ repeats, a single listen calls
-	 * this once, so there is no spam risk. See the DMP protocol-switch
-	 * note on s_rx_error_events' declaration: a nonzero value here, with
-	 * s_rx_count at 0 or truncated mid-frame, is the specific signature
-	 * that would confirm it.
-	 */
-	if (s_rx_error_events != 0 || s_rx_count != 0) {
-		printf("radio: RX ended with %u B captured, error events 0x%016llx\r\n",
-		       s_rx_count, (unsigned long long)s_rx_error_events);
-	}
+			err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+			now = OSTimeGet(&err);
+			if (now >= deadline_tick) {
+				return SL_SUBG_RX_TIMEOUT;
+			}
 
-	/* s_abort_flag, not the pended bits, is the source of truth here: the
-	 * ABORT bit only guarantees OSFlagPend() woke up promptly, but
-	 * sl_subg_abort() may have been called and cleared again (by a second
-	 * sl_subg_clear_abort()) before this line runs on a slow scheduler --
-	 * s_abort_flag reflects the flag's value at THIS instant, same contract
-	 * subg_get_pkt() had with abort_flag.
-	 */
-	if (s_abort_flag) {
-		return SL_SUBG_RX_INTERRUPTED;
-	}
-	if (!s_rx_have_data || s_rx_count == 0) {
-		return SL_SUBG_RX_TIMEOUT;
+			{
+				OS_TICK remaining = deadline_tick - now;
+				OS_TICK rearm_ticks = ms_to_ticks(SL_SUBG_RX_REARM_MS);
+
+				wait_ticks = (remaining < rearm_ticks) ? remaining : rearm_ticks;
+			}
+		} else {
+			/* timeout_ms == 0 means wait indefinitely -- still re-arm
+			 * periodically rather than blocking on one RX call forever,
+			 * for the same reason as the bounded case above.
+			 */
+			wait_ticks = ms_to_ticks(SL_SUBG_RX_REARM_MS);
+		}
+
+		s_rx_count = 0;
+		s_rx_have_data = false;
+		s_rx_error_events = 0;
+
+		/* Clear stale bits from a previous iteration/call before arming --
+		 * mirrors subg_get_pkt()'s k_sem_reset(&dio1_sem) "clear any edge
+		 * left over from a previous receive." Does NOT clear ABORT: an
+		 * abort requested just before this call (e.g. while the preceding
+		 * TX was still in flight) must still cut this receive short,
+		 * exactly the ordering subg.c's own comment on NOT clearing
+		 * abort_flag here depends on. aps.c's sl_subg_clear_abort() call,
+		 * immediately before dispatch, is the only place that clears it.
+		 */
+		err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+		(void)OSFlagPost(&s_event_flags, SL_SUBG_EVT_RX_DATA, OS_OPT_POST_FLAG_CLR, &err);
+
+		/*
+		 * Settling delay before arming RX. Every single call into this
+		 * function in this protocol is immediately preceded by our own
+		 * sl_subg_send_pkt() burst -- CMD_SEND_AND_LISTEN transmits, then
+		 * listens, by design -- so a PA ringdown / antenna-switch / AGC
+		 * settling transient at TX-to-RX turnaround gets a chance to decay
+		 * before RAIL starts trying to demodulate anything. Neither the
+		 * transaction_time fix, the re-arm loop, nor the FIFO reset above
+		 * changed the observed ~30-36 B phantom-capture signature at all
+		 * (identical byte counts across three independent live bench-pump
+		 * tests with each fix in isolation) -- ruling out DMP scheduling
+		 * and stale FIFO content, and pointing at something generated
+		 * fresh at arm time instead. This is the next candidate; not yet
+		 * confirmed.
+		 */
+		err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+		OSTimeDly(ms_to_ticks(50U), OS_OPT_TIME_DLY, &err);
+
+		/*
+		 * Also never done before this session -- the legacy RFM69 port's
+		 * own subg_get_pkt() explicitly drains its FIFO immediately before
+		 * every listen, with a specific documented reason: "residue from
+		 * the transmit that just finished is still sitting there... a 0x00
+		 * among them trips the terminator check and aborts the receive at
+		 * zero length, immediately. Against AndroidAPS that looked like
+		 * every 4000 ms send-and-listen completing instantly with nothing
+		 * heard." This driver never had an equivalent call. The observed
+		 * ~30-36 B phantom captures happen specifically on the first
+		 * re-arm right after arming and never on later re-arms in the same
+		 * listen (RTT-confirmed against the bench pump), which is what
+		 * stale FIFO content left over from the moment RX was armed -- not
+		 * a live signal -- would look like. Radio is confirmed idle here
+		 * (sl_rail_idle() below on every previous iteration, and this is
+		 * also the state on entry), which is this call's own documented
+		 * precondition.
+		 */
+		(void)sl_rail_reset_fifo(s_rail_handle, false, true);
+
+		rail_status = sl_rail_start_rx(s_rail_handle, s_channel, &scheduler_info);
+		if (rail_status != SL_RAIL_STATUS_NO_ERROR) {
+			printf("radio: start_rx failed (status 0x%04lx)\r\n",
+			       (unsigned long)rail_status);
+			return SL_SUBG_RX_TIMEOUT;
+		}
+
+		err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+		bits = OSFlagPend(&s_event_flags, SL_SUBG_EVT_RX_DATA | SL_SUBG_EVT_ABORT,
+				  wait_ticks,
+				  OS_OPT_PEND_FLAG_SET_ANY | OS_OPT_PEND_BLOCKING,
+				  NULL, &err);
+		(void)bits;
+
+		(void)sl_rail_idle(s_rail_handle, SL_RAIL_IDLE, true);
+		rearm_count++;
+
+		/* Logged here (task context, safe to printf) rather than from
+		 * sl_rail_util_on_event() (ISR context, where repeated printf
+		 * during an actual incoming packet could itself perturb the
+		 * timing this is trying to diagnose). A nonzero error-events
+		 * value with a truncated byte count is the DMP protocol-switch
+		 * signature (see s_rx_error_events' own declaration); this now
+		 * also logs which re-arm iteration produced it, since that
+		 * distinguishes "stuck on the very first attempt" from
+		 * "intermittently stuck partway through the listen."
+		 */
+		if (s_rx_error_events != 0 || s_rx_count != 0) {
+			printf("radio: RX re-arm %u ended with %u B captured, error events 0x%016llx\r\n",
+			       rearm_count, s_rx_count, (unsigned long long)s_rx_error_events);
+		}
+
+		/* s_abort_flag, not the pended bits, is the source of truth here:
+		 * the ABORT bit only guarantees OSFlagPend() woke up promptly, but
+		 * sl_subg_abort() may have been called and cleared again (by a
+		 * second sl_subg_clear_abort()) before this line runs on a slow
+		 * scheduler -- s_abort_flag reflects the flag's value at THIS
+		 * instant, same contract subg_get_pkt() had with abort_flag.
+		 */
+		if (s_abort_flag) {
+			return SL_SUBG_RX_INTERRUPTED;
+		}
+		if (s_rx_have_data && s_rx_count != 0) {
+			break;
+		}
+		/* Nothing usable this iteration -- loop back, re-check the
+		 * deadline, and re-arm for another slice.
+		 */
 	}
 
 	s_last_rssi_dbm = sl_rail_get_rssi(s_rail_handle, 0);

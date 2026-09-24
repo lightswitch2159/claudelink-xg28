@@ -214,22 +214,30 @@ probe.
 
 ## Remaining hardware checks
 
-- **Bridge still doesn't receive bench pump 646910's replies; cause not yet
-  found.** Ruled out: listen duration (a 60-second window still missed ~20
-  real in-window replies), carrier mismatch as the sole cause (646910's true
-  reply carrier was measured precisely at 916.6968 MHz from confirmed-reply
-  timestamps, and tuning wake+listen within 3 kHz of it still caught zero of
-  3 confirmed in-window replies), signal strength (646910's measured
-  amplitude is comparable to or stronger than a different pump that *does*
-  get through), and Dynamic Multiprotocol scheduler preemption (RX
-  error-event logging stayed clean on every run). A frame-length hypothesis
-  (long ~71-byte frames failing while short ones succeed) was raised and
-  then retracted -- the test tool never actually distinguished short from
-  long receptions in its output, so the evidence for it didn't hold up on
-  review; the tool now prints frame length so this is checkable on the next
-  test. See
+- **Real RX bugs found and fixed; the bridge now cleanly receives short
+  frames for the first time, but bench pump 646910's own (long) replies
+  still don't come through.** Three confirmed, fixed bugs in
+  `sl_subg_radio.c`: (1) the RX FIFO-drain ISR had no guard against a second,
+  unrelated over-the-air burst getting appended onto an already-complete
+  reception -- directly observed as a correctly-decoded 646910 reply with a
+  different pump's frame concatenated onto the end; (2) `sl_subg_get_pkt()`
+  held one RX session open for the whole caller timeout with no way to
+  recover once a reception got stuck a few dozen bytes in (RTT-confirmed:
+  ~30-36 B captured, no error, then nothing, every time) -- rewritten into a
+  loop that periodically idles, resets the RX FIFO, and re-arms; (3) no
+  settling delay between our own TX completing and RX arming, so a
+  turnaround transient had no time to decay -- a 50 ms delay eliminated it
+  completely, immediately producing clean, complete, correctly-terminated
+  receptions of a different pump's short frames, repeatedly, for the first
+  time this project. 646910's own replies -- long, and structurally full of
+  interior zero-padding -- still don't come through cleanly even with all
+  three fixes active; a live test with every fix in place still caught a
+  correctly-decoded 646910 header and model text with a second pump's frame
+  concatenated onto the end. Carrier mismatch, signal strength, and DMP
+  scheduler preemption were separately ruled out earlier and are likely moot
+  now that real, confirmed reception bugs were found. See
   [the hardware debugging handoff](DEBUGGING_NOTES_2026-09-23.md) for the
-  full analysis.
+  full analysis and current hypotheses.
 - Custom Name rename is RAM-only: no flash-backed settings storage exists
   yet, so it doesn't survive a power cycle the way "persist" implies in the
   legacy protocol.

@@ -493,50 +493,125 @@ against a separate capture file. The frame-length hypothesis is neither
 confirmed nor ruled out -- it needs re-testing with the fixed tool before it
 can be trusted either way.
 
+## Follow-up 5: real RX bugs found and fixed; frame-length question resolved differently than expected
+
+Continued under an explicit standing goal ("fix the bridge > pump comms",
+flash/test freely against the bench pump). Re-tested with the now-fixed
+probe tool (prints `len=`/`rssi=` for FOREIGN FRAME) and found real,
+confirmed firmware bugs -- not the frame-length hypothesis from Follow-up 4,
+which turned out to be moot once the actual bugs were found.
+
+**Bug 1, confirmed and fixed: `sl_rail_util_on_event()`'s RX_FIFO_ALMOST_FULL
+handler had no guard against a second firing after the current reception
+already completed.** `s_rx_have_data` only reset at the start of the next
+`sl_subg_get_pkt()` call, so a second, unrelated over-the-air burst arriving
+before the task woke up and called `sl_rail_idle()` got appended into the
+same buffer as the first. Directly observed: a probe run reported
+`BAD CRC from target serial=646910: a76469108d090337323200...0000a7560793800100...`
+-- 646910's own correctly-decoded reply header and model text
+(`a76469108d0903373232`), followed by a second pump's frame header
+(`a7560793...`) concatenated onto the end of the same buffer. Fixed by
+skipping the FIFO-drain block entirely once `s_rx_have_data` is already
+true (`sl_subg_radio.c`).
+
+**Bug 2, confirmed and fixed: a single long-lived `sl_rail_start_rx()` call
+held open for the caller's whole timeout could not recover once something
+went wrong partway through.** Live RTT evidence, identical across three
+independent tests with three different unsuccessful fix attempts in
+isolation (`transaction_time`, see below; a periodic re-arm loop; an
+explicit `sl_rail_reset_fifo()` before arming): `radio: RX ended with 36 B
+captured, error events 0x0` (and 30/32/32 B on shorter listens) -- a real
+reception, not silence, capped consistently around 30-36 B against an
+expected ~107 B max frame, no RAIL error event ever set, then nothing
+further until the caller's own timeout gave up. Rewrote `sl_subg_get_pkt()`
+from one blocking RX call into a loop that re-arms (idle, reset RX FIFO,
+re-arm) every `SL_SUBG_RX_REARM_MS` (300 ms) against the overall deadline,
+so a stuck attempt doesn't consume the whole listen window. This alone did
+not change the 30-36 B signature (tested and confirmed unchanged, ruling out
+DMP scheduling and stale FIFO content as the mechanism).
+
+**Bug 3, confirmed and fixed: no settling delay between our own TX
+completing and RX arming.** Every reception in this protocol is
+immediately preceded by our own transmission -- `CMD_SEND_AND_LISTEN`
+transmits, then listens, by design -- so a TX-to-RX turnaround transient
+(PA ringdown, antenna-switch settling) had no time to decay before RAIL
+started trying to demodulate. A 10 ms delay before each re-arm changed
+nothing (identical 30-36 B signature again). **A 50 ms delay changed
+everything**: immediately produced clean, complete, correctly-terminated
+7 B receptions of the other pump's short frames (`FOREIGN FRAME
+serial=560793 op=0x8d len=7B rssi=0dBm crc=OK`) at nearly every frequency
+tried, repeatedly, across multiple live tests -- the first time this session
+any external RF signal was received cleanly and completely by the bridge.
+Added as a fixed 50 ms `OSTimeDly()` before every RX arm in
+`sl_subg_get_pkt()`.
+
+**Still open: 646910's own replies still don't come through cleanly, even
+with all three fixes above.** A live test with the 50 ms delay active still
+produced `BAD CRC from target serial=646910:
+a76469108d090337323200000000000000000000a75607938d0093` -- 646910's real
+header and model text, followed by only 10 B of zero padding (a complete
+71 B reply has roughly 60), then a second pump's frame concatenated on.
+Two other live tests with the same firmware caught nothing at all from
+646910 despite it transmitting real, HackRF-confirmed replies within the
+listening window each time. This is a materially different, better-defined
+problem than "frame length" (Follow-up 4's retracted hypothesis): the
+receiver now demonstrably CAN complete clean receptions (proven against the
+other pump's short frames), but something about 646910's specific reply --
+long, and structurally full of interior zero-padding bytes for the unused
+portion of its fixed-width model-string field -- is not being captured
+completely or cleanly. Two live hypotheses, not yet distinguished:
+  - The raw-byte zero-terminator convention (`sl_rail_util_on_event()`
+    stops draining the instant it sees a raw 0x00 byte in the FIFO,
+    mirroring our own TX framing, which never has interior zeros) may not
+    safely generalize to an incoming pump reply, IF the 4b6b line coding's
+    guarantee that no valid data symbol decodes to a raw 0x00 byte does not
+    hold for whatever reason on receive.
+  - RAIL's fixed-107-byte, no-CRC, no-address-filter RX configuration may
+    have no way to distinguish "this transmission ended" from "the channel
+    went quiet and a different transmission started" within one continuous
+    receive session, making the raw-byte-stream scanning approach
+    fundamentally fragile whenever a second signal (real, from another
+    active pump) arrives before or during the current one's own natural
+    end -- consistent with 560793 being an unusually active, frequently-
+    transmitting neighbor throughout every capture this whole session.
+
 ## Next steps
 
-1. **Re-test with the now-fixed tool first.** `probe_722_aaps.py`'s FOREIGN
-   FRAME report now prints `len=`/`rssi=` (fixed this session -- it
-   previously printed only `serial=`/`op=`, which is what produced the
-   retracted frame-length claim above). A fresh live test against 646910,
-   or a passive listen that happens to catch a long 560793 frame, will show
-   directly whether the bridge catches short frames only, long frames too,
-   or nothing at all -- no more cross-referencing a separate capture file
-   required. This settles the frame-length question before anything else
-   below is worth pursuing.
-2. If that confirms short-only reception: check `sl_rail_config_rx_data()`'s
-   parameters and the RX fixed-length/FIFO-threshold interaction in
-   `sl_subg_radio.c` against the RAIL SDK docs -- specifically whether a
-   107-byte fixed-length RX configured for FIFO mode with a 1-byte threshold
-   has any known failure mode for longer receptions (FIFO wrap, threshold
-   re-arming, buffer overflow past `SL_SUBG_FIFO_BYTES` = 128) -- then give
-   RX an explicit fixed-length override mirroring TX's own per-call
-   `sl_rail_set_fixed_length()`.
-3. A low-RF-cost passive `--listen-only` session at a frequency/time known
-   to carry one of 560793's own long frames (0x80 data, confirmed present in
-   existing captures) is the cheapest way to test short-vs-long without
-   needing the bench pump to cooperate -- 560793 already appears to be in
-   active, ongoing communication with another system on its own schedule.
-   Tried once this session (`passive_560793_longframe_check_20260923.cs8`,
-   45 s, 916.6968 MHz, no TX at all): only 12 bursts total, none reaching
-   the 20-byte threshold -- inconclusive, not a negative result; worth
-   retrying with the fixed tool so the result is unambiguous either way.
+1. **Distinguish the two live hypotheses from Follow-up 5.** Check whether
+   the 4b6b symbol table genuinely guarantees no valid encoded byte equals
+   raw 0x00 on the RX side the way it's relied on for TX -- if that holds,
+   the zero-terminator convention is not the bug, and the fault is RAIL not
+   separating distinct over-the-air transmissions within one fixed-length
+   receive session. If it doesn't hold, the terminator scan itself needs to
+   change (e.g. require N consecutive zero bytes, or switch to a real
+   length-based framing instead of sentinel scanning).
+2. If RAIL genuinely can't separate transmissions within one session: the
+   fix is likely to shorten `sl_rail_start_rx()` sessions further (the
+   current 300 ms re-arm interval may still be too coarse against 560793's
+   observed ~1.4-2.5 s transmission cadence) or to add RSSI/carrier-sense
+   based gap detection so a real inter-transmission silence, not just a
+   raw byte value, is what ends a reception.
+3. Re-test specifically for 646910 with all four fixes from Follow-up 5 in
+   place (guard against post-terminator appending, periodic re-arm, FIFO
+   reset before arming, 50 ms settling delay) and a concurrent HackRF
+   capture, focused on getting a single, clean, uncontaminated capture
+   window (e.g. immediately after confirming via a passive listen that
+   560793 is currently quiet) to remove it as a confound while testing
+   646910 specifically.
 4. The carrier-mismatch hypothesis (916.6968 MHz measured, 71.8 kHz from the
-   916.625 MHz nominal) is not fully closed either -- it may still be a
-   contributing factor -- but Follow-up 3's uncontaminated test (wake+listen
-   within 3 kHz of the calibrated carrier, pump replied 3 times in-window,
-   bridge caught none) argues against it being the sole explanation.
-5. Minimize further live bench-pump wake cycles until item 1 above is run --
-   six wake cycles were already run this session.
-6. The DMP RX-error-event instrumentation added this session
-   (`s_rx_error_events` in `sl_subg_radio.c`) should stay in place regardless
-   -- it produced a clean negative result on every run this session (no
-   aborts/errors), which is itself evidence, and costs nothing to keep
-   watching on future tests.
-7. Preserve the foreign-frame filter. Only a valid-CRC frame with serial
+   916.625 MHz nominal) is likely moot now that Follow-up 5 found real,
+   confirmed reception bugs independent of frequency -- deprioritize unless
+   items 1-3 above are exhausted without a fix.
+5. The RX error-event instrumentation (`s_rx_error_events` in
+   `sl_subg_radio.c`) has stayed clean on every single run all session (no
+   aborts/errors) -- keep watching, but it has not yet pointed at anything.
+6. Preserve the foreign-frame filter. Only a valid-CRC frame with serial
    646910 counts as a bench response.
-8. Large `.cs8` captures stay in the local `debug-evidence/captures/` directory
-   and are excluded from Git by `.gitignore`; never use `/tmp`.
+7. Large `.cs8` captures stay in the local `debug-evidence/captures/` directory
+   and are excluded from Git by `.gitignore`; never use `/tmp`. Captures
+   whose findings are already fully documented in text (RTT logs, this file)
+   were deleted this session to save space -- the ones kept are either cited
+   here by filename or not yet fully analyzed.
 
 Suggested active command (use this interpreter path, BLE device, and bench
 serial):
@@ -567,6 +642,19 @@ hackrf_transfer -r /home/charles/ai/orangelink-xg28/debug-evidence/captures/benc
 - Historical real-pump comparison only:
   `/home/charles/ai/captures/claudelink_working_device_tuneup.cs8` and
   `/home/charles/ai/captures/claudelink_real_pump_exchange_g10_120s.cs8`.
+- Precise carrier calibration source (22 confirmed 646910 replies, FFT
+  measured at each): `debug-evidence/captures/bench_646910_extended_wake_20260923.cs8`.
+- Concatenation-bug (`BAD CRC ... 646910 header + foreign frame appended`)
+  first observed: `debug-evidence/captures/bench_646910_calibrated_carrier_test_20260923.cs8`,
+  reproduced again with the 50 ms settling-delay fix active:
+  `debug-evidence/captures/bench_646910_settle50ms_retry2_20260923.cs8`.
+- Concatenation bug also reproduced right after the `/goal` session began
+  (before the guard fix): `debug-evidence/captures/bench_646910_goal_test1_20260923.cs8`.
+- First clean, complete, correctly-terminated short-frame receptions
+  (560793), immediately following the 50 ms settling-delay fix:
+  `debug-evidence/captures/bench_646910_settle50ms_success_20260923.cs8` --
+  same test run also independently confirms 646910 transmitted real replies
+  the bridge still caught none of, ruling out "pump silent" for that run.
 - AndroidAPS references inspected locally: RileyLink
   `RileyLinkCommunicationManager.wakeUp()` and `scanForDevice()`,
   `MedtronicCommunicationManager.createPumpMessageContent()`, and
@@ -579,7 +667,12 @@ observations from hypotheses. The bench serial is the only active target.
 The real pump 560793 may be passively listened to, but never transmit to it.
 Never use a generic ACK in a mixed capture as proof of a bench response.
 The AndroidAPS-timed scan and parameterized RFPowerOn scan have both been run.
-The user requested no further tests at this wrap-up. If work resumes, investigate
-why the xG28 receiver missed 646910's HackRF-confirmed model replies. Any future
-active request must use serial 646910 only and count only its CRC-valid,
-expected-opcode response.
+A later session (2026-09-23, continued under an explicit standing goal to
+fix reception and test freely against the bench pump) found and fixed three
+real receive-path bugs -- see Follow-up 5 -- and got the bridge to cleanly
+receive short frames from the other pump (560793) for the first time this
+project. 646910's own replies still don't come through cleanly; Follow-up 5
+and the Next steps section above are the current, live state, not the
+"no further tests" note this section previously carried from an earlier
+wrap-up. Any future active request must use serial 646910 only and count
+only its CRC-valid, expected-opcode response.
