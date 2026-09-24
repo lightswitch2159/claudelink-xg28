@@ -214,43 +214,35 @@ probe.
 
 ## Remaining hardware checks
 
-- **Likely resolved as a physical RF issue, not a firmware bug: bench pump
-  646910's signal sits at the noise floor on this board's own antenna.**
-  Seven real, confirmed firmware bugs were found and fixed getting to this
-  answer (all in `sl_subg_radio.c`): a missing guard letting a second,
-  unrelated over-the-air burst get appended onto an already-complete
-  reception; `sl_subg_get_pkt()` holding one RX session open for the whole
-  caller timeout with no way to recover once a reception stalled; no
-  settling delay between our own TX completing and RX arming (a 50 ms delay
-  fixed this one outright -- immediately producing clean, complete,
-  correctly-terminated receptions of a different pump's short frames,
-  repeatedly, for the first time this project); a re-arm timer that could
-  cut off an in-progress reception that simply started late in its slice;
-  and RSSI being read after the radio had already gone idle *and* never
-  converted from the RAIL API's quarter-dBm units to the plain dBm the rest
-  of the firmware expects -- together these produced exactly the "reported
-  0 dBm RSSI is physically implausible" symptom flagged earlier in this
-  investigation. With RSSI finally reading real values, the actual answer
-  came out directly: a partial capture with `SL_RAIL_EVENT_RX_TIMING_LOST`
-  set measured -100 dBm, statistically the same as the surrounding
-  pure-noise readings (-95 to -101 dBm). 646910's signal, as received at
-  this board's own onboard antenna, is not elevated above the noise floor
-  even during a capture -- which a receiver simply cannot reliably
-  demodulate regardless of termination logic, re-arm timing, or FIFO
-  handling, all fixed or improved this session without changing this
-  outcome. This doesn't contradict the HackRF evidence throughout this
-  investigation (646910 decodes cleanly and strongly via HackRF) -- HackRF's
-  antenna, gain, and position are independent of this board's own.
-  Distance, pump-battery age, and RSSI calibration have all since been
-  ruled out (the bench pump is confirmed under a foot from the board on a
-  fresh battery, and the RAIL RSSI offset reads exactly 0 dB, no hidden
-  correction). **Current primary recommendation: vary antenna orientation**
-  (rotate the pump and/or the board at that same close range and watch
-  RSSI) -- a polarization mismatch between the two antennas is a real,
-  common RF effect independent of distance and hasn't been tested yet.
-  Carrier mismatch, signal strength comparison methodology, and DMP
-  scheduler preemption were separately ruled out earlier and are now
-  explained by this finding. See
+- **A required board component was missing from the project entirely --
+  fixing it produced a real, confirmed ~10-40 dB receive sensitivity
+  improvement, though bench pump 646910 specifically still isn't received.**
+  BRD2705A has a physical RF path switch (`hardware_board_has_rfswitch_to_ground`
+  in the board's own component metadata), and the RAIL library declares
+  `sl_rail_util_rf_path_switch` as *required* whenever that capability is
+  present -- but this project's `.slcp` never included it, a real gap in a
+  project built almost entirely through hand-edited `.slcp`/`.cmake`/`autogen`
+  files with no SLC tool ever available to validate the dependency graph.
+  The switch's two control GPIOs were never configured, left at their
+  power-on-reset default -- consistent with the board's own metadata listing
+  868 MHz as its default RF band, not the 916 MHz this project actually
+  uses. Added the component (source, config, and its own documented
+  `sl_stack_init()` wiring, all copied from the SDK's own pre-validated
+  files, not guessed) and rebuilt clean. Live result: the noise floor itself
+  dropped from ~-98 dBm to ~-111 dBm (a real, uniform sensitivity gain), and
+  a different pump's (560793) signal jumped from as low as -100 dBm to a
+  consistent -59 dBm. **646910 still wasn't received** -- 11 confirmed real
+  transmissions in the same test window, still landing on the (now lower)
+  noise floor. Seven other real, confirmed firmware bugs were also found
+  and fixed earlier in this same investigation (concatenation guard, RX
+  re-arm loop, FIFO reset, TX-to-RX settling delay, re-arm grace period,
+  RSSI idle-ordering, RSSI units -- the last two explain a "reported 0 dBm
+  RSSI is physically implausible" symptom flagged earlier in the
+  investigation). Distance, pump-battery age (confirmed fresh), and RSSI
+  calibration (offset reads exactly 0 dB) have all been ruled out as
+  explanations for 646910 specifically. Antenna orientation (rotating the
+  pump/board at the same close range) is the next thing to try, layered on
+  top of this fix. See
   [the hardware debugging handoff](DEBUGGING_NOTES_2026-09-23.md) for the
   full analysis.
 - Custom Name rename is RAM-only: no flash-backed settings storage exists

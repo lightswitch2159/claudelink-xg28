@@ -757,37 +757,108 @@ there is no software-side "wrong antenna port selected" possibility to
 separately rule out -- this board has one fixed, always-on RF path for the
 proprietary radio.
 
+**Correction to the paragraph above: that last claim was wrong** -- see
+Follow-up 10 immediately below. There IS an RF path switch on this board;
+it was simply never wired into this project at all.
+
+## Follow-up 10: real, confirmed ~10-40 dB sensitivity fix -- a required RF
+path switch component was never included in this project
+
+BRD2705A's own board component (`brd2705a.slcc`) declares
+`hardware_board_has_rfswitch` and `hardware_board_has_rfswitch_to_ground`.
+The RAIL library's own component (`rail_lib.slcc`) declares
+`sl_rail_util_rf_path_switch` as conditionally **required** whenever
+`hardware_board_has_rfswitch_to_ground` is present. This project's `.slcp`
+had no mention of it anywhere -- confirmed absent, not just unconfigured.
+Consistent with this whole project's history: it was built from a template
+via extensive hand-editing of `.slcp`/`.cmake`/`autogen/` files with no
+command-line SLC tool ever available to validate the real dependency graph,
+so a genuinely required component silently going missing was possible the
+whole time and nothing caught it.
+
+The component (`sl_rail_util_rf_path_switch.c`/`.h`, from
+`rail_library/plugin/sl_rail_util_rf_path_switch/` in the SDK) drives two
+board-specific GPIOs via the chip's PRS (Peripheral Reflex System) hardware,
+automatically tracking two internal radio signals with no runtime software
+involvement once initialized: `RACL_ACTIVE` (radio actively transmitting or
+receiving) on port D pin 3, and `SYNTH_MUX0` (which band the synthesizer is
+currently tuned to) on port B pin 0 -- both read from this board's own
+pre-validated config header
+(`boards/hardware/board/config/brd2705a/sl_rail_util_rf_path_switch_config.h`,
+copied in verbatim, not hand-guessed). Neither GPIO had ever been configured
+by this project, meaning the physical RF switch was sitting at whatever its
+power-on-reset default state happened to be, never tracking our actual
+916 MHz (914-924 MHz band) operation. Notably, the board's own metadata
+lists `hardware_board_default_rf_band_868` -- 868 MHz, a different band
+from the 916 MHz this project actually uses -- consistent with an
+unconfigured switch defaulting to the wrong path.
+
+Wired in following the component's own declared `template_contribution`
+(`sl_rail_util_rf_path_switch_init()` called from `sl_stack_init()`,
+verified against the component's own `.slcc` -- this exactly matches the
+hand-added call, not a guess) and its own required source/include/catalog
+entries, hand-patched into the Studio project the same way every other
+component addition this session has been (no SLC tool). Built clean, no
+errors.
+
+**Live result against the bench pump, HackRF running concurrently:**
+
+- The noise floor itself dropped from -95/-101 dBm to **-110/-112 dBm** --
+  a real, uniform ~10-15 dB sensitivity improvement, visible even on
+  "quiet" re-arms with nothing transmitting.
+- 560793's short frames, previously read at -59 to -100 dBm depending on
+  the run, now read consistently at **-59 dBm** with `crc=OK` on nearly
+  every scan attempt -- a ~40 dB improvement for this specific signal
+  (more than the uniform floor shift alone, suggesting the wrong-band path
+  was also adding real signal-specific attenuation beyond a flat gain
+  loss).
+- **646910 still was not received** -- 11 confirmed real transmissions
+  during this exact test window (HackRF-verified), and RTT shows the
+  bridge's own listen attempts still landing on the (now improved) noise
+  floor with `RX_TIMING_LOST`, never capturing any bytes at all this run.
+
+This is genuine, confirmed, substantial progress -- not a guess, not
+unchanged after a fix like every earlier attempt this session -- but it
+does not fully explain 646910 specifically. With signal-to-noise improved
+by double digits of dB and 560793 now trivially strong, 646910's own
+received signal remains stubbornly at the floor. The user separately
+confirmed the bench pump's battery is new, ruling out a simple depleted-
+battery explanation; some other pump-side factor (antenna condition,
+matching, or transmitter health on a long-idle bench unit, independent of
+battery charge) or a still-unidentified receive-side factor specific to
+646910's exact carrier/timing remains open.
+
 ## Next steps
 
-1. **Physical: vary antenna orientation, not distance.** Distance,
-   pump-battery age, and RSSI calibration are all ruled out (Follow-up 9).
-   With the pump already <1 ft away, try rotating the pump and/or the board
-   through a few different orientations at that same close range and watch
-   the per-re-arm RSSI log (Follow-up 7's instrumentation) for a meaningful
-   change. A 20-30 dB null from antenna polarization mismatch is real and
-   would fully explain the observation without any further firmware change.
-2. If orientation changes RSSI meaningfully above the noise floor, re-test
-   reception directly -- the termination/concatenation bugs fixed in
-   Follow-ups 5 and 6 should then have a real, strong-enough signal to
-   actually terminate cleanly against, the same way 560793's already does.
-3. If orientation doesn't help either: consider whether this specific
-   board's sub-GHz antenna path/matching has a defect (compare RSSI on a
-   second, known-good board if one is available), or capture a fresh HackRF
-   recording of 646910 *from the board's own physical position* (rather
-   than HackRF's own separate antenna/position used throughout this
-   session) as a more directly comparable reference than the existing
-   captures.
+1. **Keep testing 646910 now that the RF path switch fix is in
+   (Follow-up 10).** The fix is real and substantial (~10-15 dB uniform
+   noise-floor improvement, ~40 dB for 560793 specifically) but hasn't yet
+   produced a 646910 catch across the one test run it's had so far (11 real
+   transmissions, zero received). Run a few more live tests -- the previous
+   ~40 dB improvement for 560793 suggests real headroom exists that
+   646910 may still benefit from on a lucky attempt, or with the antenna
+   orientation test from Follow-up 9 (still not tried) layered on top.
+2. **Antenna orientation, layered on top of the switch fix.** Follow-up 9's
+   orientation test was never actually run (superseded in the moment by the
+   switch-fix discovery) -- try it now, with the switch fix active, since
+   the two are independent and may compound.
+3. If 646910 still doesn't come through after both: consider whether this
+   specific bench pump's transmitter (antenna, matching, PA health -- not
+   battery, already confirmed fresh) is simply weaker than 560793's, and
+   whether a second, known-working pump or board is available to compare
+   against as an isolating test.
 4. Implement RSSI/carrier-sense based termination as a robustness
    improvement regardless of the above (a real signal that drops to the
    noise floor mid-frame, e.g. from fading, should still terminate cleanly
-   rather than trigger `RX_TIMING_LOST`) -- calibration data for this
-   already exists (~-98 dBm noise floor, Follow-up 7).
+   rather than trigger `RX_TIMING_LOST`) -- fresh calibration data exists
+   from Follow-up 10 (~-111 dBm noise floor with the switch fix active, an
+   update from Follow-up 7's pre-fix ~-98 dBm).
 5. The carrier-mismatch hypothesis (916.6968 MHz measured, 71.8 kHz from the
    916.625 MHz nominal) and the frame-length hypothesis (retracted in
-   Follow-up 4) are both closed -- Follow-up 8/9 explain the observations
+   Follow-up 4) are both closed -- Follow-ups 8-10 explain the observations
    both were trying to explain.
 6. The RSSI fix in Follow-up 7 (reported RSSI was always exactly 0 dBm due
-   to two stacked bugs, now fixed and itself how Follow-ups 8-9's findings
+   to two stacked bugs, now fixed and itself how Follow-ups 8-10's findings
    were possible) should be re-verified against a real, strong 646910 reply
    once reception works -- AndroidAPS uses reply RSSI for frequency-scan
    ranking (`mmtune`), so this matters for more than just diagnostics.
@@ -838,6 +909,11 @@ hackrf_transfer -r /home/charles/ai/orangelink-xg28/debug-evidence/captures/benc
   with RX_TIMING_LOST at -100 dBm, statistically the same as the
   surrounding pure-noise readings):
   `debug-evidence/captures/bench_646910_rssi_calibration_20260923.cs8`.
+- RF path switch fix verification (Follow-up 10): 11 confirmed real 646910
+  transmissions in-window, still not received, but 560793 jumped to a
+  consistent -59 dBm (from ~-100 dBm pre-fix) and the noise floor itself
+  dropped to ~-111 dBm:
+  `debug-evidence/captures/bench_646910_rfpath_switch_fix_20260924.cs8`.
 - Concatenation-bug (`BAD CRC ... 646910 header + foreign frame appended`)
   first observed: `debug-evidence/captures/bench_646910_calibrated_carrier_test_20260923.cs8`,
   reproduced again with the 50 ms settling-delay fix active:
