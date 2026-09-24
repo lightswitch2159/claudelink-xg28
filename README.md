@@ -240,10 +240,15 @@ probe.
   handling, all fixed or improved this session without changing this
   outcome. This doesn't contradict the HackRF evidence throughout this
   investigation (646910 decodes cleanly and strongly via HackRF) -- HackRF's
-  antenna, gain, and position are independent of this board's own. **Primary
-  recommendation: reposition the bench pump closer to (or reorient it
-  toward) the board's antenna and re-test** before any further firmware
-  change. Carrier mismatch, signal strength comparison methodology, and DMP
+  antenna, gain, and position are independent of this board's own.
+  Distance, pump-battery age, and RSSI calibration have all since been
+  ruled out (the bench pump is confirmed under a foot from the board on a
+  fresh battery, and the RAIL RSSI offset reads exactly 0 dB, no hidden
+  correction). **Current primary recommendation: vary antenna orientation**
+  (rotate the pump and/or the board at that same close range and watch
+  RSSI) -- a polarization mismatch between the two antennas is a real,
+  common RF effect independent of distance and hasn't been tested yet.
+  Carrier mismatch, signal strength comparison methodology, and DMP
   scheduler preemption were separately ruled out earlier and are now
   explained by this finding. See
   [the hardware debugging handoff](DEBUGGING_NOTES_2026-09-23.md) for the

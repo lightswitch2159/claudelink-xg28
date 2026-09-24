@@ -721,43 +721,76 @@ investigation) -- HackRF's antenna, gain, and position are independent of
 and different from this board's own onboard antenna. A signal can be
 strong at one receive point and weak at another.
 
+## Follow-up 9: distance ruled out (pump confirmed <1 ft away, fresh
+battery); RSSI offset checked and is not the explanation
+
+Follow-up 8's "reposition farther/closer" framing was wrong: the user
+confirmed the bench pump has been sitting **less than a foot** from the
+board this whole time, on a **new battery**. At that range free-space path
+loss is negligible (a few dB at most) -- a genuinely working transmitter
+should read tens of dB above the noise floor, not statistically at it. Both
+of Follow-up 8's leading alternative explanations (weak/degraded bench-unit
+transmitter from age or a dying battery) are now ruled out by the user's
+direct knowledge of this specific pump. This is a real, still-unexplained
+anomaly, not something distance or pump condition accounts for.
+
+Checked the RAIL SDK's own suggestion that RSSI "carries a per-PHY offset
+set by the radio calculator" in addition to anything set explicitly --
+`sl_subg_radio_init()` now logs `sl_rail_get_rssi_offset()` at boot.
+Live-read: **`radio: RSSI offset = 0 dB`**. No large hidden calibration
+correction is being applied; the raw value we've been reading all session
+is essentially the value RAIL is actually measuring, not misrepresented by
+an uncharacterized offset. This rules out "our RSSI numbers are just
+wrong/uncalibrated" as the explanation for the anomaly.
+
+With distance, pump age/battery, and RSSI calibration all ruled out, the
+leading remaining hypothesis is **antenna orientation/polarization
+mismatch** between the pump's own internal antenna and the board's -- a
+20-30 dB null from cross-polarization is a real, common RF phenomenon
+entirely independent of distance, and neither device's antenna orientation
+has been varied yet this session. Asked the user to try rotating the pump
+(or the board) through a few orientations at the same close range and watch
+the RSSI readings (now logged automatically per re-arm, see Follow-up 7) --
+result not yet known as of this entry. No antenna-diversity or antenna-port
+selection component is present in this project's `.slcp` (checked), so
+there is no software-side "wrong antenna port selected" possibility to
+separately rule out -- this board has one fixed, always-on RF path for the
+proprietary radio.
+
 ## Next steps
 
-1. **Physical: reposition the bench pump closer to (or reorient it toward)
-   the board's own onboard antenna, then re-test.** This is now the primary
-   recommendation, ahead of any further firmware change. Follow-up 8 found
-   646910's signal sitting at the noise floor (-100 dBm during a partial
-   capture, statistically the same as pure-noise readings of -95 to
-   -101 dBm) specifically at this board's own antenna, while the same
-   transmissions decode cleanly and strongly via HackRF throughout this
-   whole investigation -- different antenna, different position, different
-   result. This is a physical RF path issue, not something more firmware
-   iteration is likely to fix. This action needs a person at the bench;
-   record before/after RSSI readings (already logged automatically per
-   re-arm) to confirm.
-2. If repositioning raises 646910's RSSI meaningfully above the noise
-   floor, re-test reception directly -- the termination/concatenation bugs
-   fixed in Follow-ups 5 and 6 should then have a real, strong-enough
-   signal to actually terminate cleanly against, the same way 560793's
-   already does.
-3. If repositioning does not help (signal still at the noise floor even at
-   close range), reconsider TX power/antenna matching on the bench pump
-   side, or whether the bench unit's transmitter itself is weaker than a
-   normal in-service pump (plausible for a long-idle bench unit).
-4. Only after 1-3 are exhausted: implement RSSI/carrier-sense based
-   termination as a robustness improvement regardless (a real signal that
-   drops to the noise floor mid-frame, e.g. from fading, should still
-   terminate cleanly rather than trigger `RX_TIMING_LOST`) -- calibration
-   data for this already exists (~-98 dBm noise floor, Follow-up 7).
+1. **Physical: vary antenna orientation, not distance.** Distance,
+   pump-battery age, and RSSI calibration are all ruled out (Follow-up 9).
+   With the pump already <1 ft away, try rotating the pump and/or the board
+   through a few different orientations at that same close range and watch
+   the per-re-arm RSSI log (Follow-up 7's instrumentation) for a meaningful
+   change. A 20-30 dB null from antenna polarization mismatch is real and
+   would fully explain the observation without any further firmware change.
+2. If orientation changes RSSI meaningfully above the noise floor, re-test
+   reception directly -- the termination/concatenation bugs fixed in
+   Follow-ups 5 and 6 should then have a real, strong-enough signal to
+   actually terminate cleanly against, the same way 560793's already does.
+3. If orientation doesn't help either: consider whether this specific
+   board's sub-GHz antenna path/matching has a defect (compare RSSI on a
+   second, known-good board if one is available), or capture a fresh HackRF
+   recording of 646910 *from the board's own physical position* (rather
+   than HackRF's own separate antenna/position used throughout this
+   session) as a more directly comparable reference than the existing
+   captures.
+4. Implement RSSI/carrier-sense based termination as a robustness
+   improvement regardless of the above (a real signal that drops to the
+   noise floor mid-frame, e.g. from fading, should still terminate cleanly
+   rather than trigger `RX_TIMING_LOST`) -- calibration data for this
+   already exists (~-98 dBm noise floor, Follow-up 7).
 5. The carrier-mismatch hypothesis (916.6968 MHz measured, 71.8 kHz from the
    916.625 MHz nominal) and the frame-length hypothesis (retracted in
-   Follow-up 4) are both closed -- Follow-up 8 explains the observations
+   Follow-up 4) are both closed -- Follow-up 8/9 explain the observations
    both were trying to explain.
 6. The RSSI fix in Follow-up 7 (reported RSSI was always exactly 0 dBm due
-   to two stacked bugs, now fixed and itself how Follow-up 8's finding was
-   possible) should be re-verified against a real, strong 646910 reply once
-   reception works -- AndroidAPS uses reply RSSI for frequency-scan ranking
-   (`mmtune`), so this matters for more than just diagnostics.
+   to two stacked bugs, now fixed and itself how Follow-ups 8-9's findings
+   were possible) should be re-verified against a real, strong 646910 reply
+   once reception works -- AndroidAPS uses reply RSSI for frequency-scan
+   ranking (`mmtune`), so this matters for more than just diagnostics.
 7. Preserve the foreign-frame filter. Only a valid-CRC frame with serial
    646910 counts as a bench response.
 8. Large `.cs8` captures stay in the local `debug-evidence/captures/` directory

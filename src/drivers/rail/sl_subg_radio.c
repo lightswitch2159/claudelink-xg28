@@ -331,6 +331,21 @@ int sl_subg_radio_init(void)
 		return -1;
 	}
 
+	/*
+	 * Diagnostic: a bench pump confirmed at less than a foot away, on a
+	 * fresh battery, still measured at the noise floor (~-100 dBm,
+	 * DEBUGGING_NOTES_2026-09-23.md Follow-up 8) -- at that range, free-
+	 * space path loss is negligible, so a genuinely working transmitter
+	 * should read tens of dB above the floor. sl_rail_set_rssi_offset()'s
+	 * own doc says RSSI carries "a per-PHY offset set by the radio
+	 * calculator" in addition to anything set explicitly -- this driver
+	 * has never called sl_rail_set_rssi_offset() itself, so logging
+	 * whatever offset is already in effect checks whether our own
+	 * reported RSSI is even meaningful in absolute terms before
+	 * suspecting the pump or the antenna.
+	 */
+	printf("radio: RSSI offset = %d dB\r\n", sl_rail_get_rssi_offset(s_rail_handle));
+
 	/* Static allocation, matching the source's K_SEM_DEFINE-style static
 	 * allocation rather than the heap. Must exist before
 	 * sl_rail_config_events() below unmasks events that could otherwise race
