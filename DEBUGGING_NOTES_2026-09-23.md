@@ -828,43 +828,71 @@ matching, or transmitter health on a long-idle bench unit, independent of
 battery charge) or a still-unidentified receive-side factor specific to
 646910's exact carrier/timing remains open.
 
+## Follow-up 11: one more full post-fix run, still zero 646910 bytes --
+the switch fix looks frequency-specific, not a general SNR fix
+
+Ran one more full wake+scan test with the RF path switch fix active
+(`bench_646910_postfix_retry1_20260924.cs8`), on top of Follow-up 10's own
+verification run. 15 more real, HackRF-confirmed 646910 transmissions in
+this window (11 in Follow-up 10's run, 26 total across both runs since the
+fix). RTT shows the noise floor holding at the new, improved ~-109 to
+-111 dBm throughout, `RX_TIMING_LOST` on every attempt, and **0 B captured
+on every single re-arm in this run** -- not even the ~30 B partial captures
+seen pre-fix. Zero 646910 bytes have now been captured in either test since
+the switch fix went in.
+
+This is a meaningful negative result, not just "still broken": if the
+switch fix's ~10-15 dB gain were a flat, broadband improvement, a signal
+that was marginally readable before (the pre-fix ~30 B partial captures)
+should be more readable now, not less. Instead 646910 went from
+"occasionally captures a few dozen bytes" to "captures nothing at all."
+The likely explanation is that the fix's benefit is not uniform gain but
+frequency-selectivity: correcting a wrong-band filter path removes
+*frequency-specific* attenuation (matching why 560793's improvement, ~40 dB,
+was larger than the ~10-15 dB floor shift), which would help a signal
+whose problem was being filtered by the wrong band, but would not help --
+and could plausibly even slightly hurt, if the new correctly-selected
+filter has a narrower or differently-centered passband than the
+previously-uncontrolled default -- a signal whose real problem is simply
+low transmit power at the source. This is consistent with 646910's
+transmitter itself being weak (independent of its confirmed-fresh battery)
+rather than any remaining fixable receive-path issue.
+
 ## Next steps
 
-1. **Keep testing 646910 now that the RF path switch fix is in
-   (Follow-up 10).** The fix is real and substantial (~10-15 dB uniform
-   noise-floor improvement, ~40 dB for 560793 specifically) but hasn't yet
-   produced a 646910 catch across the one test run it's had so far (11 real
-   transmissions, zero received). Run a few more live tests -- the previous
-   ~40 dB improvement for 560793 suggests real headroom exists that
-   646910 may still benefit from on a lucky attempt, or with the antenna
-   orientation test from Follow-up 9 (still not tried) layered on top.
-2. **Antenna orientation, layered on top of the switch fix.** Follow-up 9's
-   orientation test was never actually run (superseded in the moment by the
-   switch-fix discovery) -- try it now, with the switch fix active, since
-   the two are independent and may compound.
-3. If 646910 still doesn't come through after both: consider whether this
-   specific bench pump's transmitter (antenna, matching, PA health -- not
-   battery, already confirmed fresh) is simply weaker than 560793's, and
-   whether a second, known-working pump or board is available to compare
-   against as an isolating test.
-4. Implement RSSI/carrier-sense based termination as a robustness
+1. **Antenna orientation is now the primary untested lead.** The RF path
+   switch fix (Follow-up 10) is real and substantial but, per Follow-up 11,
+   looks frequency-specific rather than a general SNR improvement -- two
+   full post-fix runs (26 confirmed real 646910 transmissions combined)
+   produced zero captured bytes, not even the partial captures seen
+   pre-fix. Orientation (rotating the pump and/or board at the same close
+   range while watching the per-re-arm RSSI log) was proposed in Follow-up
+   9 but never actually tried -- still the one variable in this whole
+   investigation that hasn't been tested at all.
+2. If orientation doesn't move 646910's RSSI either: this now looks like a
+   real property of this specific bench pump's transmitter (antenna
+   condition, matching, or PA health -- not battery, confirmed fresh, and
+   not this bridge's receive path, confirmed working well via 560793 and
+   the switch fix). A second, known-working pump or board to compare
+   against would be the next isolating test, if available.
+3. Implement RSSI/carrier-sense based termination as a robustness
    improvement regardless of the above (a real signal that drops to the
    noise floor mid-frame, e.g. from fading, should still terminate cleanly
    rather than trigger `RX_TIMING_LOST`) -- fresh calibration data exists
    from Follow-up 10 (~-111 dBm noise floor with the switch fix active, an
    update from Follow-up 7's pre-fix ~-98 dBm).
-5. The carrier-mismatch hypothesis (916.6968 MHz measured, 71.8 kHz from the
+4. The carrier-mismatch hypothesis (916.6968 MHz measured, 71.8 kHz from the
    916.625 MHz nominal) and the frame-length hypothesis (retracted in
    Follow-up 4) are both closed -- Follow-ups 8-10 explain the observations
    both were trying to explain.
-6. The RSSI fix in Follow-up 7 (reported RSSI was always exactly 0 dBm due
+5. The RSSI fix in Follow-up 7 (reported RSSI was always exactly 0 dBm due
    to two stacked bugs, now fixed and itself how Follow-ups 8-10's findings
    were possible) should be re-verified against a real, strong 646910 reply
    once reception works -- AndroidAPS uses reply RSSI for frequency-scan
    ranking (`mmtune`), so this matters for more than just diagnostics.
-7. Preserve the foreign-frame filter. Only a valid-CRC frame with serial
+6. Preserve the foreign-frame filter. Only a valid-CRC frame with serial
    646910 counts as a bench response.
-8. Large `.cs8` captures stay in the local `debug-evidence/captures/` directory
+7. Large `.cs8` captures stay in the local `debug-evidence/captures/` directory
    and are excluded from Git by `.gitignore`; never use `/tmp`. Captures
    whose findings are already fully documented in text (RTT logs, this file)
    were deleted this session to save space -- the ones kept are either cited
@@ -914,6 +942,9 @@ hackrf_transfer -r /home/charles/ai/orangelink-xg28/debug-evidence/captures/benc
   consistent -59 dBm (from ~-100 dBm pre-fix) and the noise floor itself
   dropped to ~-111 dBm:
   `debug-evidence/captures/bench_646910_rfpath_switch_fix_20260924.cs8`.
+- Second post-fix run (Follow-up 11): 15 more confirmed real 646910
+  transmissions, 0 B captured on every attempt (not even a partial):
+  `debug-evidence/captures/bench_646910_postfix_retry1_20260924.cs8`.
 - Concatenation-bug (`BAD CRC ... 646910 header + foreign frame appended`)
   first observed: `debug-evidence/captures/bench_646910_calibrated_carrier_test_20260923.cs8`,
   reproduced again with the 50 ms settling-delay fix active:
