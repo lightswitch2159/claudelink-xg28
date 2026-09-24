@@ -88,26 +88,19 @@ extern "C" {
 #define SL_SUBG_CHANNEL 1U
 #define SL_SUBG_FREQ_HZ 916548000U
 
-/* Channel map, read from the generated autogen/rail_config.c this session:
- * baseFrequency = 916000000, channelSpacing = 548000, channels 0..20. The APS
- * protocol layer (src/aps/aps.c, ported from the legacy RileyLink command set)
- * asks for an arbitrary frequency in Hz, computed from three CC111x-style
- * register bytes the host sends -- there is no RAIL call that tunes to an
- * arbitrary Hz value directly, only sl_rail_start_tx/sl_rail_start_rx(channel).
- * So sl_subg_set_freq() maps the requested Hz onto the nearest in-range channel
- * of this same static config, rather than reconfiguring the PHY.
+/* The host protocol permits tuning throughout the 916 MHz band. The generated
+ * Studio map is only a coarse startup map, so sl_subg_set_freq() installs a
+ * one-channel runtime map at the requested frequency while retaining the
+ * generated PHY and channel attributes.
  */
-#define SL_SUBG_BASE_FREQ_HZ 916000000U
-#define SL_SUBG_CHANNEL_SPACING_HZ 548000U
-#define SL_SUBG_CHANNEL_MIN 0U
-#define SL_SUBG_CHANNEL_MAX 20U
+#define SL_SUBG_FREQ_MIN_HZ 914000000U
+#define SL_SUBG_FREQ_MAX_HZ 918000000U
 
-/* Matches SUBG_MAX_PKT_LEN in the working firmware (src/subg/subg.h) --
- * deliberately kept identical so the protocol layer above this driver can be
- * ported with the same buffer sizing, not a new, independently-chosen limit.
- * Also the Radio Configurator's Frame Fixed Length payload size (config saved
- * in Studio: FIXED_LENGTH, 107 bytes), so the radio's own declared frame
- * length matches what the application considers the real ceiling.
+/* Matches the legacy firmware's 107-byte maximum Minimed RX payload and APS
+ * encoding buffer. This is a capacity, not a fixed over-the-air TX length:
+ * Minimed TX sends the actual encoded bytes plus a zero terminator. The RAIL
+ * driver adjusts the configured fixed frame length per TX and restores this
+ * 107-byte RX setting afterward.
  */
 #define SL_SUBG_MAX_PKT_LEN 107U
 
@@ -194,27 +187,22 @@ uint16_t sl_subg_get_rx_count(void);
 uint16_t sl_subg_get_tx_count(void);
 
 /**
- * @brief Tune to the channel nearest @p hz within the static channel map
- * (SL_SUBG_BASE_FREQ_HZ + n * SL_SUBG_CHANNEL_SPACING_HZ, n in
- * [SL_SUBG_CHANNEL_MIN, SL_SUBG_CHANNEL_MAX]). Takes effect on the next
- * sl_subg_send_pkt()/sl_subg_get_pkt() call.
+ * @brief Tune to @p hz by registering a runtime single-channel RAIL map based
+ * on the generated PHY. Takes effect on the next sl_subg_send_pkt() or
+ * sl_subg_get_pkt() call.
  *
- * @return 0 if @p hz is within the map (channel selected), -1 if it falls
- * outside the nearest-channel's spacing/2 tolerance and was ignored -- mirrors
- * rf69_set_freq() returning success/failure to aps.c's apply_pending_freq(),
- * which already logs and discards out-of-band requests using that return.
+ * @return 0 if the runtime map was accepted, -1 if @p hz is outside the
+ * supported band or RAIL rejected the map.
  */
 int sl_subg_set_freq(uint32_t hz);
 
-/** @brief Hz of the channel sl_subg_set_freq() most recently selected
- * (or SL_SUBG_FREQ_HZ / channel SL_SUBG_CHANNEL if never called).
+/** @brief Hz most recently requested through sl_subg_set_freq(), or the
+ * default SL_SUBG_FREQ_HZ before the host requests a tune.
  */
 uint32_t sl_subg_get_freq(void);
 
-/** @brief Reset to the default channel (SL_SUBG_CHANNEL). Mirrors
- * rf69_config_916() as used by aps.c's CMD_RESET_RADIO_CFG -- RAIL's PHY
- * config is static (set once by sl_rail_util_init()), so there is no register
- * table to reload; only the channel selection is reset.
+/** @brief Reset the runtime channel map to SL_SUBG_FREQ_HZ. Mirrors
+ * rf69_config_916() as used by aps.c's CMD_RESET_RADIO_CFG.
  */
 void sl_subg_reset_radio_cfg(void);
 

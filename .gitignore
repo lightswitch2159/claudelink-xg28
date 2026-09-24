@@ -1,0 +1,2 @@
+# Local HackRF IQ evidence is large; keep it in the workspace, not Git history.
+/debug-evidence/captures/*.cs8

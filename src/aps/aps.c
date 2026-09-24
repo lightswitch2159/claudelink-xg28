@@ -16,9 +16,10 @@
  *    plays that role; see its header banner for why it isn't shaped like the
  *    RFM69 driver.
  * 2. rf69_set_freq()/rf69_get_freq() -> sl_subg_set_freq()/sl_subg_get_freq(),
- *    which map a requested Hz onto the nearest RAIL channel of the static
- *    channel config rather than retuning a synthesizer register -- see the
- *    comment on sl_subg_set_freq() in the driver header. rf69_config_916() ->
+ *    which install a one-channel RAIL map at the requested Hz and report its
+ *    channel metadata. The observed RF carrier tracks requested frequency
+ *    steps, though absolute carrier offset still needs a calibrated reference.
+ *    rf69_config_916() ->
  *    sl_subg_reset_radio_cfg(), which resets channel selection only, since
  *    RAIL's PHY config is fixed at build time by the Radio Configurator, not
  *    reloaded at runtime.
@@ -306,9 +307,10 @@ static void apply_pending_freq(void)
 	 * from a real bug on the RFM69 port (a HackRF capture caught the radio
 	 * transmitting on the config-table default while this function logged
 	 * every frequency AndroidAPS asked for; the tune was computed and logged
-	 * but never took effect). sl_subg_set_freq() snaps to the nearest channel
-	 * rather than tuning a synthesizer register, so this now also catches
-	 * rounding to a channel further away than intended.
+	 * but never took effect). sl_subg_get_freq() reads back RAIL channel
+	 * metadata; the HackRF sweep independently confirms that requested tuning
+	 * changes take effect and preserve channel spacing. Metadata is not an
+	 * independent measurement of absolute RF carrier frequency.
 	 */
 	{
 		uint32_t actual = sl_subg_get_freq();

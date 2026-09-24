@@ -85,21 +85,25 @@ fresh AndroidAPS log after the fix shows CMD_UPDATE_REG writes getting real
 Response Count notifications (01, 02, 03, ...) instead of "No response from
 RileyLink".
 
-**Still no reply from the pump -- traced to the radio, not BLE.**
-`sl_subg_send_pkt()` called `sl_rail_write_tx_fifo()` and
-`sl_rail_start_tx()` without checking either return value, so a transmit
-that never actually left the radio was indistinguishable from one that sent
-fine and simply got no answer. Added real status checks (see "Diagnostic
-logging"); a live pump test now shows RAIL accepting the TX request without
-error, but the `SL_RAIL_EVENT_TX_PACKET_SENT` event never arriving --
-`radio: TX_PACKET_SENT never arrived` in the RTT log. This project is a
-Dynamic Multiprotocol build (BT + proprietary RAIL PHY sharing one radio
-core), and `sl_rail_start_tx()`'s own doc comment notes its
-`p_scheduler_info` parameter "is only used in multiprotocol version of RAIL"
--- this driver has always passed `NULL`. That is the leading suspect: without
-scheduler info, the radio's multiprotocol arbiter may never actually grant
-the proprietary stack airtime against the running BLE connection. Not fixed
-yet -- see "Not started".
+**Bridge TX is confirmed; the bridge RX path is missing replies.** This is a Dynamic
+Multiprotocol build, so TX supplies scheduler priority and bounded airtime,
+then yields the shared radio. TX uses the actual encoded length plus a zero
+terminator; the 107-byte value is the RX maximum. A controlled read-only AAPS
+test set 4b6b, sent a 12-second wake burst, and swept 11 frequencies from
+916.298 to 916.798 MHz in 50 kHz steps. The firmware read each requested
+frequency back exactly. A simultaneous 90-second HackRF capture decoded 18
+CRC-valid model replies from bench pump 646910 during the wake and scan window.
+The bridge reported every request silent and did not deliver those replies to
+the host. A separate passive listen at 916.650 MHz decoded a valid 560793 frame,
+so the RX chain works on at least one channel; alignment or RAIL receive behavior
+for the bench replies remains unresolved.
+
+RX is explicitly configured for FIFO mode so the 1-byte threshold event used by
+the zero-terminated reply handler can fire; packet mode had disabled that event
+path. `sl_rail_start_rx()` supplies DMP scheduler priority 200 so BLE connection
+events can share the radio. Do not interpret a foreign 560793 frame as a
+646910 response. See [the hardware debugging handoff](DEBUGGING_NOTES_2026-09-23.md)
+for the capture paths, per-frequency sweep results, and remaining diagnosis.
 
 ## Diagnostic logging
 
@@ -208,26 +212,12 @@ Linux needs Commander's udev rule installed (`sudo cp 99-jlink.rules
 trigger`, then replug the board) before it can see the on-board J-Link debug
 probe.
 
-## Not started
+## Remaining hardware checks
 
-- **The proprietary radio never actually transmits against a live BLE
-  connection.** See "Still no reply from the pump" above -- `sl_rail_start_tx()`
-  reports success but `TX_PACKET_SENT` never fires. Leading suspect:
-  `sl_rail_start_tx()` is called with `p_scheduler_info = NULL` throughout
-  `sl_subg_radio.c`, but the SDK's own doc comment says that parameter "is
-  only used in multiprotocol version of RAIL" -- and this is one. Next step:
-  build a real `sl_rail_scheduler_info_t` (priority/requested duration) and
-  pass it to `sl_rail_start_tx()`, then re-test with the RTT TX-status
-  logging already in place; check whether `sl_subg_get_pkt()`'s RX path
-  needs the same treatment once TX is confirmed working. This is the actual
-  blocker for talking to a pump, not a BLE issue.
-- A real, separate frequency-tuning bug surfaced during the same test and is
-  still open: `apply_pending_freq()` logged `tune FAILED: asked 916649780 Hz,
-  radio reads 916548000 Hz` -- `sl_subg_set_freq()` snapped to the nearest
-  configured channel rather than reaching the frequency AndroidAPS asked
-  for, ~102 kHz off. Needs the project's Radio Configurator channel map
-  checked (channel spacing/count) once TX itself is confirmed working --
-  no point tuning correctly for packets that don't leave the radio.
+- **Bridge receive still needs repair.** HackRF decoded valid 646910 responses
+  over the air, while the bridge's 50 kHz and targeted 5 kHz BLE scans returned
+  silent. Correlate RAIL RX timing/channel metadata with the captured response
+  carriers, then verify the fix against bench pump 646910.
 - Custom Name rename is RAM-only: no flash-backed settings storage exists
   yet, so it doesn't survive a power cycle the way "persist" implies in the
   legacy protocol.

@@ -31,6 +31,7 @@
 #include "sl_rail.h"
 #include "sl_rail_types.h"
 #include "sl_rail_util_init.h"   /* sl_rail_util_init(), sl_rail_util_get_handle() */
+#include "rail_config.h"         /* generated channelConfigs[] */
 
 #include "os.h"
 #include "rtos_err.h"
@@ -76,6 +77,13 @@ static sl_rail_handle_t s_rail_handle;
  */
 #define SL_SUBG_TX_DONE_TIMEOUT_MS 150U
 
+/* The configured PHY is 16.384 kbps with a 128-bit preamble and 32-bit sync
+ * word. Include those 160 bits plus a 2 ms margin in the scheduler estimate. */
+#define SL_SUBG_BITRATE_BPS           16384U
+#define SL_SUBG_PREAMBLE_SYNC_BITS    160U
+#define SL_SUBG_TX_MARGIN_US          2000U
+#define SL_SUBG_TX_SLIP_TIME_US       100000U
+
 static OS_FLAG_GRP s_event_flags;
 
 static OS_TICK ms_to_ticks(uint32_t ms)
@@ -112,11 +120,21 @@ static uint8_t s_rx_buf[SL_SUBG_MAX_PKT_LEN];
 static uint8_t s_rx_count;
 static volatile bool s_rx_have_data;
 static volatile bool s_tx_done;
+static volatile bool s_tx_underflow;
 static volatile bool s_abort_flag;
 static int16_t s_last_rssi_dbm = INT16_MIN;
 static uint16_t s_rx_pkt_count;
 static uint16_t s_tx_pkt_count;
 static uint16_t s_channel = SL_SUBG_CHANNEL;
+static uint32_t s_frequency_hz = SL_SUBG_FREQ_HZ;
+
+/* RAIL's channel configuration is cached by pointer, so keep this runtime
+ * single-channel map in static storage. Clone the generated PHY and channel
+ * attributes, then update only the frequency for each host tuning request.
+ */
+static RAIL_ChannelConfig_t s_frequency_channel_config;
+static RAIL_ChannelConfigEntry_t s_frequency_channel_entry;
+static bool s_frequency_channel_config_ready;
 
 /*
  * RAIL event callback -- the equivalent of the RFM69 port's DIO1 ISR
@@ -190,6 +208,9 @@ void sl_rail_util_on_event(sl_rail_handle_t handle, sl_rail_events_t events)
 		err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
 		(void)OSFlagPost(&s_event_flags, SL_SUBG_EVT_TX_DONE, OS_OPT_POST_FLAG_SET, &err);
 	}
+	if (events & SL_RAIL_EVENT_TX_UNDERFLOW) {
+		s_tx_underflow = true;
+	}
 
 	/* TODO: SL_RAIL_EVENT_RX_FIFO_OVERFLOW is a real, named event and is not
 	 * handled here yet -- on the RFM69 side an equivalent overrun is a
@@ -204,6 +225,10 @@ int sl_subg_radio_init(void)
 	RTOS_ERR err;
 	uint16_t rx_size = SL_SUBG_FIFO_BYTES;
 	sl_rail_status_t st;
+	const sl_rail_rx_data_config_t rx_data_config = {
+		.rx_source = SL_RAIL_RX_DATA_SOURCE_PACKET_DATA,
+		.rx_method = SL_RAIL_DATA_METHOD_FIFO_MODE,
+	};
 
 	/*
 	 * Do NOT call sl_rail_util_init() here -- REAL HARDWARE BUG FOUND AND
@@ -244,6 +269,18 @@ int sl_subg_radio_init(void)
 		return -1;
 	}
 
+	/* The RX callback consumes bytes as they arrive and terminates on the
+	 * Minimed zero sentinel. Packet mode (RAIL's default) disables FIFO
+	 * threshold events, so the existing RX_FIFO_ALMOST_FULL handler would never
+	 * run even though it is enabled below. Select FIFO mode explicitly.
+	 */
+	st = sl_rail_config_rx_data(s_rail_handle, &rx_data_config);
+	if (st != SL_RAIL_STATUS_NO_ERROR) {
+		printf("radio: RX FIFO mode config failed (status 0x%04lx)\r\n",
+		       (unsigned long)st);
+		return -1;
+	}
+
 	st = sl_rail_set_tx_fifo(s_rail_handle, s_tx_fifo, SL_SUBG_FIFO_BYTES, 0, 0);
 	if (st != SL_STATUS_OK) {
 		return -1;
@@ -254,11 +291,31 @@ int sl_subg_radio_init(void)
 		return -1;
 	}
 
-	(void)sl_rail_set_rx_fifo_threshold(s_rail_handle, SL_SUBG_FIFO_BYTES / 2);
+	/* The legacy Orangelink RFM69 config uses PA0 at output level 31,
+	 * approximately +13 dBm. The xG28 PA utility's project default is only
+	 * +10 dBm, so select the legacy-equivalent output explicitly after PA
+	 * initialization. sl_rail_util_pa_init() runs in sl_stack_init() before
+	 * app_init() reaches this function.
+	 */
+	if (sl_subg_set_power_level(13) != 0) {
+		printf("radio: failed to set TX power to +13 dBm\r\n");
+		return -1;
+	}
+
+	/* Minimed replies are short, zero-terminated variable-length frames.
+	 * A half-FIFO threshold suppresses the only event we currently use to
+	 * drain RX for every reply shorter than 65 bytes, so they silently time
+	 * out. RAIL keeps RX_FIFO_ALMOST_FULL asserted while FIFO occupancy is
+	 * above the threshold; drain from a low threshold to see short frames as
+	 * they arrive and stop immediately at their zero terminator.
+	 */
+	(void)sl_rail_set_rx_fifo_threshold(s_rail_handle, 1U);
 
 	st = sl_rail_config_events(s_rail_handle,
-				   SL_RAIL_EVENT_RX_FIFO_ALMOST_FULL | SL_RAIL_EVENT_TX_PACKET_SENT,
-				   SL_RAIL_EVENT_RX_FIFO_ALMOST_FULL | SL_RAIL_EVENT_TX_PACKET_SENT);
+				   SL_RAIL_EVENT_RX_FIFO_ALMOST_FULL | SL_RAIL_EVENT_TX_PACKET_SENT
+				   | SL_RAIL_EVENT_TX_UNDERFLOW,
+				   SL_RAIL_EVENT_RX_FIFO_ALMOST_FULL | SL_RAIL_EVENT_TX_PACKET_SENT
+				   | SL_RAIL_EVENT_TX_UNDERFLOW);
 	if (st != SL_STATUS_OK) {
 		return -1;
 	}
@@ -277,9 +334,38 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
 
 	for (uint8_t i = 0; i <= repeat_cnt; i++) {
 		uint16_t fifo_written;
+		uint16_t tx_frame_len = (uint16_t)len + 1U;
+		uint8_t tx_data[SL_SUBG_MAX_PKT_LEN + 1U];
 		sl_rail_status_t tx_sc;
+		sl_rail_scheduler_info_t scheduler_info = {
+			.priority = 100,
+			.slip_time = SL_SUBG_TX_SLIP_TIME_US,
+			.transaction_time = (((uint32_t)tx_frame_len * 8U + SL_SUBG_PREAMBLE_SYNC_BITS)
+					     * 1000000U / SL_SUBG_BITRATE_BPS)
+					    + SL_SUBG_TX_MARGIN_US,
+		};
+		uint16_t configured_len;
+
+		if (len == 0 || len > SL_SUBG_MAX_PKT_LEN) {
+			return -1;
+		}
+
+		/* Legacy Minimed framing sends a variable number of encoded bytes,
+		 * followed by a zero terminator. 107 is the maximum RX payload; it is
+		 * not the length of every TX frame. RAIL uses the configured fixed
+		 * length for TX, so override it to payload + terminator for each send.
+		 */
+		configured_len = sl_rail_set_fixed_length(s_rail_handle, tx_frame_len);
+		if (configured_len != tx_frame_len) {
+			printf("radio: failed to set TX frame length %u (got %u)\r\n",
+			       tx_frame_len, configured_len);
+			return -1;
+		}
+		memcpy(tx_data, data, len);
+		tx_data[len] = 0;
 
 		s_tx_done = false;
+		s_tx_underflow = false;
 		err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
 		(void)OSFlagPost(&s_event_flags, SL_SUBG_EVT_TX_DONE, OS_OPT_POST_FLAG_CLR, &err);
 
@@ -291,10 +377,12 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
 		 * for real (not guessed) while investigating a live pump test
 		 * where AndroidAPS got no reply at all.
 		 */
-		fifo_written = sl_rail_write_tx_fifo(s_rail_handle, data, len, true);
-		tx_sc = sl_rail_start_tx(s_rail_handle, s_channel, SL_RAIL_TX_OPTIONS_DEFAULT, NULL);
+		fifo_written = sl_rail_write_tx_fifo(s_rail_handle, tx_data,
+						    tx_frame_len, true);
+		tx_sc = sl_rail_start_tx(s_rail_handle, s_channel,
+					 SL_RAIL_TX_OPTIONS_DEFAULT, &scheduler_info);
 
-		if (i == 0 && (fifo_written != len || tx_sc != SL_RAIL_STATUS_NO_ERROR)) {
+		if (i == 0 && (fifo_written != tx_frame_len || tx_sc != SL_RAIL_STATUS_NO_ERROR)) {
 			/* Permanent checkpoint, not temporary -- see the comment
 			 * above. First repeat only: repeat_cnt can be 200+ (a
 			 * real AndroidAPS wakeup burst), and a genuine failure
@@ -302,7 +390,7 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
 			 * times over RTT.
 			 */
 			printf("radio: TX FAILED (fifo %u/%u B written, start_tx status 0x%04lx)\r\n",
-			       fifo_written, len, (unsigned long)tx_sc);
+			       fifo_written, tx_frame_len, (unsigned long)tx_sc);
 		}
 
 		/* Bounded, not indefinite -- unlike sl_subg_get_pkt()'s
@@ -320,8 +408,21 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
 				 NULL, &err);
 
 		if (i == 0 && !s_tx_done) {
-			printf("radio: TX_PACKET_SENT never arrived (timeout waiting for it)\r\n");
+			printf("radio: TX_PACKET_SENT timeout%s\r\n",
+			       s_tx_underflow ? " after TX_UNDERFLOW" : "");
 		}
+
+		/* Instantaneous TX must yield the shared radio when it completes.
+		 * On timeout, abort first so a stuck transmission cannot overlap the
+		 * next repeat, then yield the radio back to the BLE scheduler. */
+		if (!s_tx_done) {
+			(void)sl_rail_idle(s_rail_handle, SL_RAIL_IDLE_ABORT, true);
+		}
+		(void)sl_rail_yield_radio(s_rail_handle);
+		/* Restore the configurator's default fixed RX ceiling. Passing
+		 * SL_RAIL_SET_FIXED_LENGTH_INVALID removes the TX override. */
+		(void)sl_rail_set_fixed_length(s_rail_handle,
+					       SL_RAIL_SET_FIXED_LENGTH_INVALID);
 
 		if (repeat_interval_ms && i < repeat_cnt) {
 			err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
@@ -336,6 +437,15 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 {
 	RTOS_ERR err;
 	OS_FLAGS bits;
+	sl_rail_status_t rail_status;
+	/* The receive is an indefinite RAIL operation, so transaction_time is
+	 * intentionally omitted. Priority 200 follows Silicon Labs' DMP example
+	 * for background RX; the scheduler can still interleave higher-priority
+	 * BLE connection events on the shared radio.
+	 */
+	const sl_rail_scheduler_info_t scheduler_info = {
+		.priority = 200,
+	};
 
 	s_rx_count = 0;
 	s_rx_have_data = false;
@@ -351,7 +461,12 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 	err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
 	(void)OSFlagPost(&s_event_flags, SL_SUBG_EVT_RX_DATA, OS_OPT_POST_FLAG_CLR, &err);
 
-	(void)sl_rail_start_rx(s_rail_handle, s_channel, NULL);
+	rail_status = sl_rail_start_rx(s_rail_handle, s_channel, &scheduler_info);
+	if (rail_status != SL_RAIL_STATUS_NO_ERROR) {
+		printf("radio: start_rx failed (status 0x%04lx)\r\n",
+		       (unsigned long)rail_status);
+		return SL_SUBG_RX_TIMEOUT;
+	}
 
 	/* timeout_ms == 0 means wait indefinitely -- see ms_to_ticks() above for
 	 * why 0 maps straight through to OSFlagPend()'s own 0-means-forever
@@ -440,30 +555,64 @@ uint16_t sl_subg_get_tx_count(void)
 
 int sl_subg_set_freq(uint32_t hz)
 {
-	if (hz < SL_SUBG_BASE_FREQ_HZ) {
+	const RAIL_ChannelConfig_t *generated_config;
+	sl_rail_status_t st;
+
+	if (hz < SL_SUBG_FREQ_MIN_HZ || hz > SL_SUBG_FREQ_MAX_HZ) {
 		return -1;
 	}
 
-	uint32_t n = (hz - SL_SUBG_BASE_FREQ_HZ + SL_SUBG_CHANNEL_SPACING_HZ / 2)
-		     / SL_SUBG_CHANNEL_SPACING_HZ;
+	if (!s_frequency_channel_config_ready) {
+		generated_config = channelConfigs[0];
+		if (generated_config == NULL || generated_config->length == 0
+		    || generated_config->configs == NULL) {
+			return -1;
+		}
 
-	/* SL_SUBG_CHANNEL_MIN is 0, so n (unsigned) is never below it -- only the
-	 * upper bound is a real check.
+		s_frequency_channel_config = *generated_config;
+		s_frequency_channel_entry = generated_config->configs[0];
+		s_frequency_channel_config.configs = &s_frequency_channel_entry;
+		s_frequency_channel_config.length = 1;
+		s_frequency_channel_entry.channelSpacing = 0;
+		s_frequency_channel_entry.physicalChannelOffset = 0;
+		s_frequency_channel_entry.channelNumberStart = 0;
+		s_frequency_channel_entry.channelNumberEnd = 0;
+		s_frequency_channel_config_ready = true;
+	}
+
+	/* A zero channel spacing maps logical channel 0 directly to baseFrequency.
+	 * Re-register the same static config after changing the requested frequency;
+	 * RAIL applies it on the next start_tx/start_rx call.
 	 */
-	if (n > SL_SUBG_CHANNEL_MAX) {
+	s_frequency_channel_entry.baseFrequency = hz;
+	st = sl_rail_config_channels(s_rail_handle,
+				     (const sl_rail_channel_config_t *)(const void *)&s_frequency_channel_config,
+				     sl_rail_util_on_channel_config_change);
+	if (st != SL_RAIL_STATUS_NO_ERROR) {
 		return -1;
 	}
 
-	s_channel = (uint16_t)n;
+	s_channel = 0;
+	s_frequency_hz = hz;
 	return 0;
 }
 
 uint32_t sl_subg_get_freq(void)
 {
-	return SL_SUBG_BASE_FREQ_HZ + (uint32_t)s_channel * SL_SUBG_CHANNEL_SPACING_HZ;
+	sl_rail_channel_metadata_t metadata;
+	uint16_t count = 1;
+
+	if (s_rail_handle != SL_RAIL_EFR32_HANDLE
+	    && sl_rail_get_channel_metadata(s_rail_handle, &metadata, &count,
+					    s_channel, s_channel) == SL_RAIL_STATUS_NO_ERROR
+	    && count == 1) {
+		return metadata.frequency_hz;
+	}
+
+	return s_frequency_hz;
 }
 
 void sl_subg_reset_radio_cfg(void)
 {
-	s_channel = SL_SUBG_CHANNEL;
+	(void)sl_subg_set_freq(SL_SUBG_FREQ_HZ);
 }
