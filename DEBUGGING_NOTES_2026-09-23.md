@@ -635,36 +635,91 @@ detail on when it reliably fires; enabling and logging it (same pattern as
 the three RX error events added in Follow-up 5) would be the next low-cost
 thing to try before committing to a full RSSI-polling redesign.
 
+## Follow-up 7: SL_RAIL_EVENT_RX_TIMING_LOST confirmed firing; two more real
+bugs found and fixed (RSSI always invalid, and stored in the wrong units)
+
+Enabled and logged `SL_RAIL_EVENT_RX_TIMING_LOST` per the previous
+follow-up's suggestion. Live-confirmed firing repeatedly against the bench
+pump: `error events 0x0000000000040000` (bit 18, exactly this event) on
+receptions that captured 0-36 B and no terminator -- including on the very
+signature (~30-36 B, no error previously recorded) that drove most of this
+session's earlier investigation. RAIL itself is reporting a real,
+named condition, not just "nothing happened."
+
+While adding RSSI to the same diagnostic line to start gathering real
+squelch-threshold calibration data, found two more concrete bugs, both in
+`sl_subg_get_pkt()`:
+
+- **RSSI was always invalid.** `sl_rail_get_rssi()` was called after
+  `sl_rail_idle()` everywhere in this file, including the pre-existing
+  end-of-function read that becomes `s_last_rssi_dbm` -- the value this
+  driver reports back to the host for every successful reply. The RAIL
+  SDK's own doc for `sl_rail_get_rssi()` is explicit: "if the radio is in
+  or transitions to IDLE or TX, `SL_RAIL_RSSI_INVALID` will be returned."
+  Live-confirmed: every reading, on every outcome, came back exactly `-512`
+  -- `SL_RAIL_RSSI_INVALID` in the API's own quarter-dBm units
+  (`(-128 dBm) * 4`) -- until fixed.
+- **The value was never converted from quarter-dBm to plain dBm.**
+  `sl_rail_get_rssi()` documents its return value as quarter-dBm, but
+  `s_last_rssi_dbm` (by its own name, and `aps.c`'s `rssi_to_cc111x(int16_t
+  dbm)` parameter) is plain dBm. The old code stored the raw value with no
+  `/4`. Combined with the always-invalid bug above, this is almost
+  certainly the exact source of the "reported 0 dBm RSSI is physically
+  implausible" symptom already flagged earlier in this file from
+  `probe_722_aaps.py` output: `rssi_to_cc111x(-512) = (-512+73)*2 = -878`,
+  which truncates to `uint8_t` `146`, and AndroidAPS's/the probe's own
+  inverse formula `(146/2)-73` is exactly `0`. A long-standing, previously
+  unexplained oddity now has a confirmed, fixed root cause.
+
+Fixed both: RSSI is now read before `sl_rail_idle()`, while genuinely still
+in RX, and divided by 4 before being stored.
+
+**Real calibration data gathered as a result** (the actual point of this
+follow-up): with the fix in place, RSSI now reads real values, consistently
+**-96 to -100 dBm**, both during quiet re-arms and ones where
+`RX_TIMING_LOST` fired. This is essentially the noise floor at this
+frequency on this hardware -- and `TIMING_LOST` firing at noise-floor RSSI,
+not an elevated level, suggests these particular events are RAIL's OOK
+detector triggering on ordinary noise crossing its own threshold, not the
+receiver losing lock on a real, stronger signal that started successfully.
+No RSSI reading during an actual 646910 concatenation event has been
+captured yet (RTT's own unreliability made it hard to align a read with
+that specific outcome this session) -- that comparison (concatenation-event
+RSSI vs. this ~-98 dBm noise floor) is the missing data point for picking a
+real squelch threshold.
+
 ## Next steps
 
-1. **Enable and log `SL_RAIL_EVENT_RX_TIMING_LOST`** alongside the existing
-   three RX error events in `sl_subg_radio.c` (same pattern: record in the
-   ISR into `s_rx_error_events`, print from task context in
-   `sl_subg_get_pkt()`). Cheap, no design changes, and would show directly
-   whether RAIL itself ever recognizes 646910's transmission ending, even
-   if our own byte-scanning doesn't act on it correctly.
-2. **The real fix is very likely RSSI/carrier-sense based termination**,
-   not another timing/retry parameter -- Follow-up 6 ruled out interior
-   zero-value bytes, and Follow-up 5+6 together show more time/retries just
-   captures more unrelated traffic rather than fixing 646910's reply
-   specifically. Needs: (a) a real noise-floor RSSI measurement on this
-   exact setup (frequency, antenna, environment) to pick a safe squelch
-   threshold -- do not guess a constant; (b) a way to poll RSSI during an
-   in-progress reception (task context, so likely inside the grace-period
-   loop added in Follow-up 6) and treat a sustained drop to the floor as
-   "transmission ended, stop and process whatever's in the buffer" instead
-   of continuing to drain whatever comes next.
-3. Once RSSI-based termination exists, re-test specifically for 646910 with
-   a concurrent HackRF capture, ideally during a window confirmed quiet for
-   560793 first (a quick passive listen) to remove it as a confound while
-   testing 646910 specifically.
+1. **Capture RSSI during an actual 646910 concatenation event** (or any
+   capture with real bytes and `TIMING_LOST`) to compare against the
+   confirmed ~-98 dBm noise floor from Follow-up 7. This is the one missing
+   data point before a squelch threshold can be picked with any confidence
+   -- RTT's own unreliability (frequent mid-session disconnects) made this
+   hard to align this session; worth a few more focused attempts, or
+   logging RSSI on every single re-arm temporarily (not just every 20th)
+   during a short, targeted test.
+2. **Implement RSSI/carrier-sense based termination once that data point
+   exists.** Follow-up 6 ruled out interior zero-value bytes; Follow-up 5+6
+   showed more time/retries just captures more unrelated traffic rather
+   than fixing 646910's reply; Follow-up 7 shows `TIMING_LOST` firing at
+   noise-floor RSSI, suggesting at least some of these events are the OOK
+   detector triggering on ordinary noise, not losing lock on a real
+   stronger signal. A real threshold, once calibrated, would let the
+   receiver treat "RSSI sustained at the noise floor" as "nothing real is
+   here, stop trying" -- independent of raw byte values entirely.
+3. Once implemented, re-test specifically for 646910 with a concurrent
+   HackRF capture, ideally during a window confirmed quiet for 560793 first
+   (a quick passive listen) to remove it as a confound while testing 646910
+   specifically.
 4. The carrier-mismatch hypothesis (916.6968 MHz measured, 71.8 kHz from the
    916.625 MHz nominal) and the frame-length hypothesis (retracted in
    Follow-up 4) are both likely moot now -- deprioritize unless items 1-3
    above are exhausted without a fix.
-5. The RX error-event instrumentation (`s_rx_error_events` in
-   `sl_subg_radio.c`) has stayed clean on every single run all session (no
-   aborts/errors) -- keep watching, but it has not yet pointed at anything.
+5. The RSSI fix in Follow-up 7 (reported RSSI was always exactly 0 dBm due
+   to two stacked bugs, now fixed) should be verified against a real pump
+   reply once 646910 is received cleanly -- AndroidAPS uses reply RSSI for
+   frequency-scan ranking (`mmtune`), so this matters for more than just
+   diagnostics once reception works.
 6. Preserve the foreign-frame filter. Only a valid-CRC frame with serial
    646910 counts as a bench response.
 7. Large `.cs8` captures stay in the local `debug-evidence/captures/` directory
@@ -704,6 +759,10 @@ hackrf_transfer -r /home/charles/ai/orangelink-xg28/debug-evidence/captures/benc
   `/home/charles/ai/captures/claudelink_real_pump_exchange_g10_120s.cs8`.
 - Precise carrier calibration source (22 confirmed 646910 replies, FFT
   measured at each): `debug-evidence/captures/bench_646910_extended_wake_20260923.cs8`.
+- Cleanest negative result: 16 confirmed 646910 replies, zero 560793
+  activity anywhere in the 71 s capture (verified with `--serial 560793`,
+  `crc_valid_frames=0`), bridge caught nothing at all:
+  `debug-evidence/captures/bench_646910_timinglost_test_20260923.cs8`.
 - Concatenation-bug (`BAD CRC ... 646910 header + foreign frame appended`)
   first observed: `debug-evidence/captures/bench_646910_calibrated_carrier_test_20260923.cs8`,
   reproduced again with the 50 ms settling-delay fix active:

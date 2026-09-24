@@ -243,11 +243,22 @@ probe.
   radio (EFR32/RAIL) the way it apparently does on the RFM69 chip the
   original zero-terminator convention was designed around -- the fix is
   likely RSSI/carrier-sense based termination rather than another retiming
-  attempt, not yet implemented (needs a real noise-floor measurement on
-  this setup first, not a guessed threshold). Carrier mismatch, signal
-  strength, and DMP scheduler preemption were separately ruled out earlier.
-  See [the hardware debugging handoff](DEBUGGING_NOTES_2026-09-23.md) for
-  the full analysis and current hypotheses.
+  attempt. `SL_RAIL_EVENT_RX_TIMING_LOST` is now confirmed firing on live
+  hardware on exactly these failed receptions. Two more real bugs were
+  found and fixed while instrumenting this: RSSI was always read after the
+  radio had already gone idle (RAIL documents this as always returning its
+  invalid sentinel), and the value was never converted from the API's
+  quarter-dBm units to the plain dBm the rest of the firmware expects --
+  together these produced exactly the "reported 0 dBm RSSI is physically
+  implausible" symptom noted earlier in this investigation. Fixed; real
+  RSSI now reads consistently around -98 dBm (the noise floor on this
+  setup), which is the calibration data a real squelch threshold needs --
+  one more comparison point (RSSI during an actual concatenation event) is
+  still needed before implementing termination on it. Carrier mismatch,
+  signal strength, and DMP scheduler preemption were separately ruled out
+  earlier. See
+  [the hardware debugging handoff](DEBUGGING_NOTES_2026-09-23.md) for the
+  full analysis and current hypotheses.
 - Custom Name rename is RAM-only: no flash-backed settings storage exists
   yet, so it doesn't survive a power cycle the way "persist" implies in the
   legacy protocol.

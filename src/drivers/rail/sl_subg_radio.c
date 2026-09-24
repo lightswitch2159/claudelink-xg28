@@ -272,11 +272,24 @@ void sl_rail_util_on_event(sl_rail_handle_t handle, sl_rail_events_t events)
 	 * see sl_subg_get_pkt()'s own comment for why the printf happens
 	 * there instead.
 	 */
+	/*
+	 * SL_RAIL_EVENT_RX_TIMING_LOST added while chasing why 646910's own
+	 * reply never produces a clean receive even with everything else in
+	 * this file fixed (guard against post-terminator appending, periodic
+	 * re-arm, FIFO reset before arming, a 50 ms TX-to-RX settling delay,
+	 * and a grace period for a reception already in progress) -- see
+	 * DEBUGGING_NOTES_2026-09-23.md Follow-up 6. If RAIL itself notices
+	 * losing symbol/bit timing partway through a reception (which a
+	 * corrupted or undemodulated terminator would plausibly cause), this
+	 * is the cheapest way to see that directly, before committing to a
+	 * full RSSI-polling redesign.
+	 */
 	if (events & (SL_RAIL_EVENT_RX_PACKET_ABORTED | SL_RAIL_EVENT_RX_FRAME_ERROR
-		      | SL_RAIL_EVENT_RX_FIFO_OVERFLOW)) {
+		      | SL_RAIL_EVENT_RX_FIFO_OVERFLOW | SL_RAIL_EVENT_RX_TIMING_LOST)) {
 		s_rx_error_events |= events & (SL_RAIL_EVENT_RX_PACKET_ABORTED
 						| SL_RAIL_EVENT_RX_FRAME_ERROR
-						| SL_RAIL_EVENT_RX_FIFO_OVERFLOW);
+						| SL_RAIL_EVENT_RX_FIFO_OVERFLOW
+						| SL_RAIL_EVENT_RX_TIMING_LOST);
 	}
 }
 
@@ -394,10 +407,12 @@ int sl_subg_radio_init(void)
 	st = sl_rail_config_events(s_rail_handle,
 				   SL_RAIL_EVENT_RX_FIFO_ALMOST_FULL | SL_RAIL_EVENT_TX_PACKET_SENT
 				   | SL_RAIL_EVENT_TX_UNDERFLOW | SL_RAIL_EVENT_RX_PACKET_ABORTED
-				   | SL_RAIL_EVENT_RX_FRAME_ERROR | SL_RAIL_EVENT_RX_FIFO_OVERFLOW,
+				   | SL_RAIL_EVENT_RX_FRAME_ERROR | SL_RAIL_EVENT_RX_FIFO_OVERFLOW
+				   | SL_RAIL_EVENT_RX_TIMING_LOST,
 				   SL_RAIL_EVENT_RX_FIFO_ALMOST_FULL | SL_RAIL_EVENT_TX_PACKET_SENT
 				   | SL_RAIL_EVENT_TX_UNDERFLOW | SL_RAIL_EVENT_RX_PACKET_ABORTED
-				   | SL_RAIL_EVENT_RX_FRAME_ERROR | SL_RAIL_EVENT_RX_FIFO_OVERFLOW);
+				   | SL_RAIL_EVENT_RX_FRAME_ERROR | SL_RAIL_EVENT_RX_FIFO_OVERFLOW
+				   | SL_RAIL_EVENT_RX_TIMING_LOST);
 	if (st != SL_STATUS_OK) {
 		return -1;
 	}
@@ -706,22 +721,83 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 			}
 		}
 
-		(void)sl_rail_idle(s_rail_handle, SL_RAIL_IDLE, true);
-		rearm_count++;
-
-		/* Logged here (task context, safe to printf) rather than from
-		 * sl_rail_util_on_event() (ISR context, where repeated printf
-		 * during an actual incoming packet could itself perturb the
-		 * timing this is trying to diagnose). A nonzero error-events
-		 * value with a truncated byte count is the DMP protocol-switch
-		 * signature (see s_rx_error_events' own declaration); this now
-		 * also logs which re-arm iteration produced it, since that
-		 * distinguishes "stuck on the very first attempt" from
-		 * "intermittently stuck partway through the listen."
+		/*
+		 * REAL BUG, CAUGHT WHILE ADDING THIS DIAGNOSTIC: sl_rail_get_rssi()
+		 * was being called after sl_rail_idle() everywhere in this file,
+		 * including the pre-existing end-of-function read that becomes
+		 * s_last_rssi_dbm (the RSSI value this driver reports back to the
+		 * host for every successful reply). The RAIL SDK's own doc for
+		 * sl_rail_get_rssi() is explicit: "if the radio is in or
+		 * transitions to IDLE or TX, SL_RAIL_RSSI_INVALID will be
+		 * returned." Live-confirmed: every single reading this session,
+		 * on every outcome (timing-lost failures and clean successful
+		 * receptions alike), came back exactly -512 -- SL_RAIL_RSSI_INVALID
+		 * in the API's own quarter-dBm units ((-128 dBm) * 4). This is
+		 * almost certainly also the root cause of the "reported 0 dBm RSSI
+		 * is physically implausible" issue already flagged in
+		 * DEBUGGING_NOTES_2026-09-23.md from earlier probe_722_aaps.py
+		 * output -- whatever downstream conversion the probe applies to a
+		 * silently-invalid value happens to land on 0. Fixed by reading
+		 * RSSI here, before idling, while still genuinely in RX.
 		 */
-		if (s_rx_error_events != 0 || s_rx_count != 0) {
-			printf("radio: RX re-arm %u ended with %u B captured, error events 0x%016llx\r\n",
-			       rearm_count, s_rx_count, (unsigned long long)s_rx_error_events);
+		{
+			int16_t rssi = sl_rail_get_rssi(s_rail_handle, SL_RAIL_GET_RSSI_NO_WAIT);
+
+			(void)sl_rail_idle(s_rail_handle, SL_RAIL_IDLE, true);
+			rearm_count++;
+
+			if (s_rx_have_data) {
+				/* sl_rail_get_rssi() returns quarter-dBm; s_last_rssi_dbm
+				 * (per its own name, and rssi_to_cc111x()'s int16_t dbm
+				 * parameter in aps.c) is plain dBm. The pre-existing code
+				 * this replaces stored the raw quarter-dBm value directly
+				 * with no conversion -- on top of always being
+				 * SL_RAIL_RSSI_INVALID (-512) from the idle-timing bug,
+				 * that fed rssi_to_cc111x(-512) = (-512+73)*2 = -878,
+				 * which truncates to uint8_t 146 -- and AndroidAPS's own
+				 * inverse formula, (146/2)-73, is exactly 0. That is
+				 * almost certainly the source of the "reported 0 dBm RSSI
+				 * is physically implausible" symptom already flagged in
+				 * DEBUGGING_NOTES_2026-09-23.md from earlier probe output.
+				 */
+				s_last_rssi_dbm = rssi / 4;
+			}
+
+			/* Logged here (task context, safe to printf) rather than
+			 * from sl_rail_util_on_event() (ISR context, where repeated
+			 * printf during an actual incoming packet could itself
+			 * perturb the timing this is trying to diagnose). A nonzero
+			 * error-events value with a truncated byte count is the DMP
+			 * protocol-switch signature (see s_rx_error_events' own
+			 * declaration); this now also logs which re-arm iteration
+			 * produced it, since that distinguishes "stuck on the very
+			 * first attempt" from "intermittently stuck partway through
+			 * the listen."
+			 *
+			 * RSSI logged while gathering real calibration data for a
+			 * future RSSI/carrier-sense based termination scheme (see
+			 * DEBUGGING_NOTES_2026-09-23.md Follow-up 6's "Next steps").
+			 * Logged on every re-arm, not just ones with captured bytes,
+			 * specifically to also capture quiet-channel/noise-floor
+			 * baseline samples for comparison -- a real squelch
+			 * threshold needs both. Values are quarter-dBm (divide by 4
+			 * for dBm) per sl_rail_get_rssi()'s own documented units.
+			 */
+			if (s_rx_error_events != 0 || s_rx_count != 0) {
+				printf("radio: RX re-arm %u ended with %u B captured, "
+				       "error events 0x%016llx, rssi %d (%d dBm)\r\n",
+				       rearm_count, s_rx_count,
+				       (unsigned long long)s_rx_error_events, rssi, rssi / 4);
+			} else if ((rearm_count % 20U) == 1U) {
+				/* Sparse baseline sample -- every 20th empty re-arm
+				 * (roughly every 6 s at the 300 ms interval), not
+				 * every single one, to avoid RTT spam over a long
+				 * listen window while still getting real noise-floor
+				 * data points across the whole session.
+				 */
+				printf("radio: RX re-arm %u quiet, rssi %d (%d dBm)\r\n",
+				       rearm_count, rssi, rssi / 4);
+			}
 		}
 
 		/* s_abort_flag, not the pended bits, is the source of truth here:
@@ -742,7 +818,11 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 		 */
 	}
 
-	s_last_rssi_dbm = sl_rail_get_rssi(s_rail_handle, 0);
+	/* s_last_rssi_dbm was already captured above, before this successful
+	 * iteration's sl_rail_idle() call -- see that block's own comment for
+	 * why reading it here (after the loop, radio long since idle) would
+	 * only ever return SL_RAIL_RSSI_INVALID.
+	 */
 	memcpy(buf, s_rx_buf, s_rx_count);
 	*len = s_rx_count;
 	s_rx_pkt_count++;
