@@ -122,6 +122,12 @@ static volatile bool s_rx_have_data;
 static volatile bool s_tx_done;
 static volatile bool s_tx_underflow;
 static volatile bool s_abort_flag;
+/* Raw OR of any RX_PACKET_ABORTED/RX_FRAME_ERROR/RX_FIFO_OVERFLOW events
+ * seen during the current sl_subg_get_pkt() call -- see that function's own
+ * comment on why this is recorded here (ISR context) but only printed there
+ * (task context). Cleared at the start of each call.
+ */
+static volatile sl_rail_events_t s_rx_error_events;
 static int16_t s_last_rssi_dbm = INT16_MIN;
 static uint16_t s_rx_pkt_count;
 static uint16_t s_tx_pkt_count;
@@ -212,12 +218,29 @@ void sl_rail_util_on_event(sl_rail_handle_t handle, sl_rail_events_t events)
 		s_tx_underflow = true;
 	}
 
-	/* TODO: SL_RAIL_EVENT_RX_FIFO_OVERFLOW is a real, named event and is not
-	 * handled here yet -- on the RFM69 side an equivalent overrun is a
-	 * silent data-corruption risk that was specifically designed around
-	 * (REG_IRQFLAGS2 FIFOOVERRUN handling in rf69_cfg_916[]). Needs the same
-	 * care here before this is trusted against real traffic.
+	/*
+	 * Investigating a real bench-hardware finding: HackRF independently
+	 * decoded 18 CRC-valid pump replies during a live test window this
+	 * firmware's own rx_packets counter never incremented for -- so
+	 * something is destroying or never surfacing an in-flight receive
+	 * before sl_subg_get_pkt() sees it. This is a Dynamic Multiprotocol
+	 * build, and the RAIL SDK's own sl_rail_config_rx_data() doc carries
+	 * a direct note: "When using multiprotocol, if a protocol's receive
+	 * FIFO or receive Packet Queue is shared with another protocol, they
+	 * will be reset during a protocol switch" -- exactly what a BLE
+	 * connection event landing mid-packet (our RX priority is
+	 * deliberately low, 200, so BLE can preempt it) would do. These three
+	 * events are what RAIL fires when that happens; none were enabled or
+	 * recorded before. Recorded here (ISR context) rather than printed --
+	 * see sl_subg_get_pkt()'s own comment for why the printf happens
+	 * there instead.
 	 */
+	if (events & (SL_RAIL_EVENT_RX_PACKET_ABORTED | SL_RAIL_EVENT_RX_FRAME_ERROR
+		      | SL_RAIL_EVENT_RX_FIFO_OVERFLOW)) {
+		s_rx_error_events |= events & (SL_RAIL_EVENT_RX_PACKET_ABORTED
+						| SL_RAIL_EVENT_RX_FRAME_ERROR
+						| SL_RAIL_EVENT_RX_FIFO_OVERFLOW);
+	}
 }
 
 int sl_subg_radio_init(void)
@@ -309,13 +332,35 @@ int sl_subg_radio_init(void)
 	 * above the threshold; drain from a low threshold to see short frames as
 	 * they arrive and stop immediately at their zero terminator.
 	 */
-	(void)sl_rail_set_rx_fifo_threshold(s_rail_handle, 1U);
+	{
+		/* Return value previously discarded -- same class of gap as the
+		 * TX FIFO/start checks below. sl_rail_set_rx_fifo_threshold()
+		 * echoes back the threshold it actually configured (mirrors
+		 * sl_rail_set_fixed_length()'s contract), so a silent failure
+		 * to apply 1 here would look identical to "RX just isn't
+		 * getting bytes" -- exactly the live bug under investigation.
+		 */
+		uint16_t applied = sl_rail_set_rx_fifo_threshold(s_rail_handle, 1U);
 
+		if (applied != 1U) {
+			printf("radio: RX FIFO threshold got %u, not 1\r\n", applied);
+		}
+	}
+
+	/* RX_PACKET_ABORTED/RX_FRAME_ERROR/RX_FIFO_OVERFLOW newly enabled --
+	 * see sl_rail_util_on_event()'s own comment on why: FIFO mode never
+	 * rolls back data on these, but also never tells the app when they
+	 * happen unless it asks, and this driver never asked. A Dynamic
+	 * Multiprotocol protocol-switch resetting our shared RX FIFO mid-packet
+	 * would surface as one of these.
+	 */
 	st = sl_rail_config_events(s_rail_handle,
 				   SL_RAIL_EVENT_RX_FIFO_ALMOST_FULL | SL_RAIL_EVENT_TX_PACKET_SENT
-				   | SL_RAIL_EVENT_TX_UNDERFLOW,
+				   | SL_RAIL_EVENT_TX_UNDERFLOW | SL_RAIL_EVENT_RX_PACKET_ABORTED
+				   | SL_RAIL_EVENT_RX_FRAME_ERROR | SL_RAIL_EVENT_RX_FIFO_OVERFLOW,
 				   SL_RAIL_EVENT_RX_FIFO_ALMOST_FULL | SL_RAIL_EVENT_TX_PACKET_SENT
-				   | SL_RAIL_EVENT_TX_UNDERFLOW);
+				   | SL_RAIL_EVENT_TX_UNDERFLOW | SL_RAIL_EVENT_RX_PACKET_ABORTED
+				   | SL_RAIL_EVENT_RX_FRAME_ERROR | SL_RAIL_EVENT_RX_FIFO_OVERFLOW);
 	if (st != SL_STATUS_OK) {
 		return -1;
 	}
@@ -449,6 +494,7 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 
 	s_rx_count = 0;
 	s_rx_have_data = false;
+	s_rx_error_events = 0;
 
 	/* Clear stale bits from a previous call before arming -- mirrors
 	 * subg_get_pkt()'s k_sem_reset(&dio1_sem) "clear any edge left over from a
@@ -480,6 +526,21 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 	(void)bits;
 
 	(void)sl_rail_idle(s_rail_handle, SL_RAIL_IDLE, true);
+
+	/* Logged here (task context, safe to printf) rather than from
+	 * sl_rail_util_on_event() (ISR context, where repeated printf during
+	 * an actual incoming packet could itself perturb the timing this is
+	 * trying to diagnose). Printed on every call, not just the first --
+	 * unlike sl_subg_send_pkt()'s 200+ repeats, a single listen calls
+	 * this once, so there is no spam risk. See the DMP protocol-switch
+	 * note on s_rx_error_events' declaration: a nonzero value here, with
+	 * s_rx_count at 0 or truncated mid-frame, is the specific signature
+	 * that would confirm it.
+	 */
+	if (s_rx_error_events != 0 || s_rx_count != 0) {
+		printf("radio: RX ended with %u B captured, error events 0x%016llx\r\n",
+		       s_rx_count, (unsigned long long)s_rx_error_events);
+	}
 
 	/* s_abort_flag, not the pended bits, is the source of truth here: the
 	 * ABORT bit only guarantees OSFlagPend() woke up promptly, but
