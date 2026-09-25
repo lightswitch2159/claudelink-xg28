@@ -62,6 +62,7 @@
 #include "gatt_db.h"
 
 #include "aps.h"
+#include "debug/dbg_log.h"
 #include "aps_transport.h"
 
 /* The advertising set handle allocated from the Bluetooth stack. */
@@ -199,7 +200,55 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
 		 * to tell apart a BLE-level failure from a failure further
 		 * down (radio reaching the actual pump).
 		 */
-		printf("ble: connection opened (handle %u)\r\n", active_connection);
+		dbg_printf("ble: connection opened (handle %u)\r\n", active_connection);
+
+		/*
+		 * DEBUG AID -- request a much longer connection interval than
+		 * whatever AndroidAPS's phone negotiates by default. Live
+		 * evidence (dbg_log capture of a full AAPS scan cycle, all 8
+		 * frequencies): sl_subg_get_pkt()'s own RX call summary showed
+		 * error events 0x0000000000040000 -- the DMP protocol-switch
+		 * signature -- on very nearly every single re-arm, at every
+		 * frequency, with captured bytes always small (0-14 B, never
+		 * approaching one 71 B frame). That rules out occasional bad
+		 * luck: something is preempting RX on a near-constant cadence.
+		 * The RX/TX scheduler-priority fix (see sl_subg_get_pkt()'s own
+		 * comment) made RX match TX's already-safe priority=100, but a
+		 * live BLE connection event is not just another app-priority
+		 * task -- Silicon Labs' DMP scheduler treats honoring the
+		 * connection interval as close to a hard constraint (missing
+		 * one risks the supervision timeout disconnecting AndroidAPS
+		 * outright), so it can very plausibly preempt sub-GHz RX
+		 * regardless of scheduler_info.priority. This project never
+		 * calls sl_bt_connection_set_parameters() at all, so whatever
+		 * interval the phone's default GATT client requests (commonly
+		 * short, tens of ms, for UI responsiveness) is accepted as-is
+		 * -- meaning connection events, and DMP's chance to interrupt
+		 * an in-progress reception, happen far more often than this
+		 * bridge's own actual traffic pattern needs. Requesting 200 ms
+		 * here (160 x 1.25 ms) cuts that event rate roughly 5-10x
+		 * relative to a typical ~20-40 ms default, well within
+		 * AndroidAPS's own multi-second command timeouts either way.
+		 * sl_bt_evt_connection_parameters_id below logs what was
+		 * actually negotiated -- the peer can still reject/renegotiate.
+		 */
+		(void)sl_bt_connection_set_parameters(active_connection,
+						       160, 160, 0, 3000, 0, 0xffff);
+		break;
+
+	/* Logs what sl_bt_connection_set_parameters() above actually got --
+	 * the peer (AndroidAPS's phone) can reject or counter-propose, so
+	 * this is the only way to know the real negotiated interval instead
+	 * of assuming the request above was honored.
+	 */
+	case sl_bt_evt_connection_parameters_id:
+		dbg_printf("ble: connection params: interval %u (%lu ms), latency %u, "
+			   "timeout %u (%lu ms)\r\n",
+			   evt->data.evt_connection_parameters.interval,
+			   (unsigned long)evt->data.evt_connection_parameters.interval * 5U / 4U,
+			   evt->data.evt_connection_parameters.latency,
+			   evt->data.evt_connection_parameters.timeout,
+			   (unsigned long)evt->data.evt_connection_parameters.timeout * 10U);
 		break;
 
 	/* The client disconnected. aps_set_active(false) aborts any
@@ -209,9 +258,9 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
 	 * the client's own timeout, and there is no longer anyone to answer.
 	 */
 	case sl_bt_evt_connection_closed_id:
-		printf("ble: connection closed (handle %u, reason 0x%04x)\r\n",
-		       evt->data.evt_connection_closed.connection,
-		       evt->data.evt_connection_closed.reason);
+		dbg_printf("ble: connection closed (handle %u, reason 0x%04x)\r\n",
+			   evt->data.evt_connection_closed.connection,
+			   evt->data.evt_connection_closed.reason);
 		aps_set_active(false);
 		active_connection = SL_BT_INVALID_CONNECTION_HANDLE;
 		start_advertising();

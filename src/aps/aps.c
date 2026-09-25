@@ -66,12 +66,14 @@
 
 #include "aps.h"
 #include "aps_transport.h"
+#include "debug/dbg_log.h"
 #include "drivers/rail/sl_subg_radio.h"
 #include "4b6b.h"
 #include "manchester.h"
 
 #include "os.h"
 #include "rtos_err.h"
+#include "sl_core.h"
 
 /* ------------------------------------------------------------------------- *
  * Byte order and logging -- local replacements for Zephyr's
@@ -103,30 +105,35 @@ static inline void aps_put_be32(uint32_t v, uint8_t *p)
 	p[3] = (uint8_t)v;
 }
 
-/* Wired to the real RTT-backed printf() this session (see
- * src/drivers/rail/sl_subg_radio.c and src/app.c's git history for how that
- * backend got added and why: it's what caught the sl_rail_util_init()
- * double-init bug on first hardware bring-up). ##__VA_ARGS__ is a GNU
- * extension (drops the trailing comma when no varargs are given) -- fine
- * here, this project only ever builds with the GCC toolchain
- * (tools/build.sh, cmake_gcc/). Every call site below already carries a real,
- * useful message (frequency tuning results, command parse failures,
- * send-and-listen outcomes) -- these were written the first time as if a
- * backend existed, so wiring one up needed no changes at the call sites.
+/* Wired to dbg_printf() (see src/debug/dbg_log.h) rather than bare printf():
+ * this session's `commander rtt connect` kept dropping mid-test regardless
+ * of fix attempted, so every APS_LOG_* call also lands in dbg_log's RAM
+ * ring buffer, fetchable after a run with a single one-shot memory read
+ * instead of needing a live debug connection to survive the whole thing.
+ * See src/drivers/rail/sl_subg_radio.c and src/app.c's git history for how
+ * the original printf() backend got added and why: it's what caught the
+ * sl_rail_util_init() double-init bug on first hardware bring-up.
+ * ##__VA_ARGS__ is a GNU extension (drops the trailing comma when no
+ * varargs are given) -- fine here, this project only ever builds with the
+ * GCC toolchain (tools/build.sh, cmake_gcc/). Every call site below already
+ * carries a real, useful message (frequency tuning results, command parse
+ * failures, send-and-listen outcomes) -- these were written the first time
+ * as if a backend existed, so wiring one up needed no changes at the call
+ * sites.
  */
-#define APS_LOG_INF(fmt, ...) printf("[aps] " fmt "\r\n", ##__VA_ARGS__)
-#define APS_LOG_WRN(fmt, ...) printf("[aps] WARN: " fmt "\r\n", ##__VA_ARGS__)
-#define APS_LOG_ERR(fmt, ...) printf("[aps] ERROR: " fmt "\r\n", ##__VA_ARGS__)
-#define APS_LOG_DBG(fmt, ...) printf("[aps] " fmt "\r\n", ##__VA_ARGS__)
+#define APS_LOG_INF(fmt, ...) dbg_printf("[aps] " fmt "\r\n", ##__VA_ARGS__)
+#define APS_LOG_WRN(fmt, ...) dbg_printf("[aps] WARN: " fmt "\r\n", ##__VA_ARGS__)
+#define APS_LOG_ERR(fmt, ...) dbg_printf("[aps] ERROR: " fmt "\r\n", ##__VA_ARGS__)
+#define APS_LOG_DBG(fmt, ...) dbg_printf("[aps] " fmt "\r\n", ##__VA_ARGS__)
 #define APS_LOG_HEXDUMP_INF(data, len, label) aps_log_hexdump(data, len, label)
 
 static void aps_log_hexdump(const uint8_t *data, uint16_t len, const char *label)
 {
-	printf("[aps] %s (%u B):", label, len);
+	dbg_printf("[aps] %s (%u B):", label, len);
 	for (uint16_t i = 0; i < len; i++) {
-		printf(" %02x", data[i]);
+		dbg_printf(" %02x", data[i]);
 	}
-	printf("\r\n");
+	dbg_printf("\r\n");
 }
 
 /* ------------------------------------------------------------------------- *
@@ -743,13 +750,40 @@ static OS_Q s_aps_queue;
 /* OSQPost() posts a POINTER, not a value copy (unlike FreeRTOS's
  * xQueueSend(), which the previous version of this file relied on) -- see
  * item 4 in the file banner. Sized to exactly APS_QUEUE_DEPTH so a pool slot
- * is never in use by more than one queued command at a time: the queue
- * itself (max_qty APS_QUEUE_DEPTH) guarantees no more than APS_QUEUE_DEPTH
- * posts are outstanding before a post is refused, which is exactly the pool
- * size.
+ * is never in use by more than one queued command at a time -- but matching
+ * the queue's max_qty to the pool size only bounds how many posts the queue
+ * itself will accept; it does NOT by itself stop a pool slot from being
+ * overwritten while still queued, since the pool write and the post used to
+ * happen in the wrong order relative to that limit. See
+ * s_aps_req_outstanding for the actual guarantee and the real bug this
+ * replaced.
  */
 static struct aps_req s_aps_req_pool[APS_QUEUE_DEPTH];
 static uint8_t s_aps_req_pool_next;
+/*
+ * REAL BUG, found while chasing why AndroidAPS's real mmtune traffic (many
+ * rapid CMD_SEND_AND_LISTEN commands, one right after another, each
+ * potentially blocking aps_task_fn() in aps_dispatch() for up to its own
+ * listen timeout) kept failing against a live pump in ways this file's own
+ * slower, one-command-at-a-time manual probe testing never reproduced --
+ * see DEBUGGING_NOTES_2026-09-23.md. The comment above s_aps_req_pool
+ * reasoned that bounding the queue to APS_QUEUE_DEPTH outstanding posts
+ * keeps a pool slot from ever being reused while still queued, but that
+ * reasoning has a gap: aps_put_cmd() used to write into
+ * s_aps_req_pool[s_aps_req_pool_next] and only THEN attempt OSQPost() and
+ * check whether it succeeded. If a 5th command arrived while 4 were still
+ * genuinely outstanding (the consumer task blocked inside aps_dispatch()
+ * on command #1), the write for #5 landed in the same physical slot as
+ * still-queued #1 -- corrupting its cmd/rssi/len/param in place -- before
+ * the OSQPost() call for #5 was ever reached, let alone found to be
+ * refused. The "busy, command 0x%02x dropped" log this produces names the
+ * NEW command, giving no indication that an OLDER, still-pending one was
+ * just silently corrupted underneath it and will be dispatched with #5's
+ * contents instead of its own. This counter, checked before the pool slot
+ * is touched at all, is what the depth-matching comment above intended to
+ * guarantee.
+ */
+static uint8_t s_aps_req_outstanding;
 
 static void aps_task_fn(void *p_arg)
 {
@@ -777,6 +811,21 @@ static void aps_task_fn(void *p_arg)
 		sl_subg_clear_abort();
 		loop_count++;
 		aps_dispatch(req);
+
+		/* Only now is req's pool slot truly free for reuse -- aps_dispatch()
+		 * reads req's fields throughout, including inside the radio calls
+		 * it makes, so decrementing any earlier (e.g. right after dequeue)
+		 * would let a new command's aps_put_cmd() reuse this same slot
+		 * while dispatch is still reading it, reintroducing the exact
+		 * corruption this counter exists to prevent.
+		 */
+		{
+			CORE_DECLARE_IRQ_STATE;
+
+			CORE_ENTER_ATOMIC();
+			s_aps_req_outstanding--;
+			CORE_EXIT_ATOMIC();
+		}
 	}
 }
 
@@ -830,9 +879,32 @@ void aps_put_cmd(const uint8_t *buf, uint16_t len, int8_t rssi)
 	}
 
 	{
-		struct aps_req *slot = &s_aps_req_pool[s_aps_req_pool_next];
+		struct aps_req *slot;
 		RTOS_ERR err;
+		bool reserved;
 
+		/* Reserve a slot BEFORE touching it -- see s_aps_req_outstanding's
+		 * own comment. Checking and incrementing atomically closes the
+		 * window the old code left open between "decide a slot is free"
+		 * and "write into it".
+		 */
+		{
+			CORE_DECLARE_IRQ_STATE;
+
+			CORE_ENTER_ATOMIC();
+			reserved = s_aps_req_outstanding < APS_QUEUE_DEPTH;
+			if (reserved) {
+				s_aps_req_outstanding++;
+			}
+			CORE_EXIT_ATOMIC();
+		}
+
+		if (!reserved) {
+			APS_LOG_DBG("busy, command 0x%02x dropped", buf[1]);
+			return;
+		}
+
+		slot = &s_aps_req_pool[s_aps_req_pool_next];
 		s_aps_req_pool_next = (uint8_t)((s_aps_req_pool_next + 1) % APS_QUEUE_DEPTH);
 
 		slot->cmd = buf[1];
@@ -844,13 +916,22 @@ void aps_put_cmd(const uint8_t *buf, uint16_t len, int8_t rssi)
 		 * OSQPost() never blocks the poster in Micrium OS (unlike
 		 * OSQPend()) -- a full queue simply returns an error rather than
 		 * blocking the caller (the BLE GATT write callback, once that
-		 * layer exists). Losing a command to a full queue is preferable
-		 * to stalling the link.
+		 * layer exists). The s_aps_req_outstanding reservation above
+		 * already guarantees this can't actually happen anymore (queue
+		 * capacity exactly matches APS_QUEUE_DEPTH), but the check is kept
+		 * as a genuine belt-and-suspenders rather than an assert, since a
+		 * dropped-but-already-reserved slot would otherwise leak a count
+		 * forever.
 		 */
 		err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
 		OSQPost(&s_aps_queue, slot, sizeof(*slot), OS_OPT_POST_FIFO, &err);
 		if (RTOS_ERR_CODE_GET(err) != RTOS_ERR_NONE) {
+			CORE_DECLARE_IRQ_STATE;
+
 			APS_LOG_DBG("busy, command 0x%02x dropped", slot->cmd);
+			CORE_ENTER_ATOMIC();
+			s_aps_req_outstanding--;
+			CORE_EXIT_ATOMIC();
 		}
 	}
 }

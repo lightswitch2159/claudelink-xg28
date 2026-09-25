@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "debug/dbg_log.h"
 #include "sl_subg_radio.h"
 #include "sl_rail.h"
 #include "sl_rail_types.h"
@@ -95,6 +96,25 @@ static sl_rail_handle_t s_rail_handle;
  * one full max-length frame at this bitrate (~62 ms) so a real, complete
  * reception is never cut off mid-frame by a re-arm; short enough to give
  * many fresh listen attempts within a typical AndroidAPS wake/scan window.
+ *
+ * TRIED 5000 FOR A DIRECT A/B TEST AGAINST A REFERENCE BRIDGE, REVERTED:
+ * the reference bridge caught a clean reply on 5/5 commands with no
+ * retries (400-500 ms round trip, HackRF-confirmed). Raising this value to
+ * 5000 to cut re-arm dead-zone count was the resulting hypothesis, tested
+ * with a 130 s HackRF-ground-truth capture correlated against the AAPS
+ * production log covering the same window (bench_646910_longrearm_test_
+ * 20260924.cs8): AndroidAPS's automatic isDeviceReachable wakeUp polling
+ * fired 5 times in that window and failed all 5 ("Failed to find pump
+ * (timeout)"), despite the bridge's own wakeup TX clearly going out on air
+ * every time. Only one genuine pump reply appeared in the whole capture,
+ * before any logged wakeUp attempt even started. That is not an
+ * improvement over the 300 ms baseline, which had already produced a full
+ * PumpConnectorReady session and a 25/25 clean capture in earlier testing
+ * this same session -- so the dead-zone-duration hypothesis above is not
+ * supported by this evidence, and 300 is restored as the working value.
+ * Left at 300 pending the next real experiment (a genuinely continuous,
+ * non-retuning single RX arm for one bounded AndroidAPS listen window,
+ * instead of just a longer period between the same periodic re-arms).
  */
 #define SL_SUBG_RX_REARM_MS           300U
 /* Grace period granted to an in-progress reception (bytes already
@@ -104,6 +124,63 @@ static sl_rail_handle_t s_rail_handle;
  * the 300 ms slice was already spent waiting.
  */
 #define SL_SUBG_RX_GRACE_MS           150U
+
+/*
+ * REAL BUG, FOUND AGAINST A PRODUCTION BRIDGE'S wakeUp() PHASE: HackRF ground
+ * truth during a live AndroidAPS wakeUp() call (25000 ms listen) showed the
+ * bench pump transmitting short 7-byte wake-ack frames on a fairly steady
+ * ~200-400 ms cadence throughout the window -- comfortably frequent relative
+ * to the fixed 300 ms re-arm period above -- yet this driver reported
+ * SL_SUBG_RX_TIMEOUT the entire time, never capturing a single one, despite
+ * the exact same re-arm loop proving reliable during AndroidAPS's own
+ * 1250 ms scanForDevice() tries (32/33 clean re-arms in the same session).
+ * The difference between the two is re-arm COUNT, not code path: a 1250 ms
+ * listen only gets ~4 re-arms, a 25000 ms listen gets ~83 -- and a FIXED
+ * re-arm period that happens to sit near-harmonic with the pump's own
+ * near-fixed ack interval can put the brief (~5 ms on-air) ack in this
+ * loop's per-re-arm dead zone (FIFO reset, retune, arm) on every single
+ * re-arm instead of eventually drifting into coverage, the way a few
+ * uncorrelated re-arms would. Confirmed independently against a real
+ * production bridge's own AndroidAPS log the same session: two distinct
+ * multi-retry wakeUp failures, both showing a DIFFERENT nearby pump's
+ * wake-ack winning every single retry in a row -- the same signature of a
+ * fixed-period listener missing a periodic transmitter again and again
+ * rather than the expected random spread of hits and misses. Jittering the
+ * re-arm period breaks any such alignment: no two consecutive re-arms (or
+ * any short run of them) sit at the same phase relative to an external
+ * periodic transmitter, so a periodic ack that is being missed on every
+ * attempt at a fixed period gets a genuinely different chance each time
+ * instead of the same missed chance repeated. The jitter sequence itself
+ * doesn't need real entropy -- multiplying by an odd constant and taking it
+ * mod a range not sharing a small common factor with typical ack intervals
+ * (101 is prime) is enough to avoid resonance; a hardware RNG would just add
+ * a blocking call for no real benefit here.
+ *
+ * REAL BUG IN THIS FIX'S OWN FIRST VERSION, CAUGHT LIVE AGAINST THE BENCH
+ * PUMP: seeding the jitter from rearm_count (reset to 0 at the top of every
+ * sl_subg_get_pkt() call) only varies the re-arm phase WITHIN one call, not
+ * BETWEEN separate wakeUp attempts -- every fresh call starts the same
+ * sequence over again. Live capture showed the pump's actual reply landing
+ * a near-constant ~1-2 s after each wake command across four consecutive
+ * AndroidAPS wakeUp() retries, i.e. the thing that needed to vary between
+ * attempts was exactly the thing the old seed held constant. A free-running
+ * counter that never resets -- incremented once per re-arm across the
+ * device's entire uptime, not per call -- gives each new wakeUp attempt a
+ * different starting phase against that same ~1-2 s post-wake window
+ * instead of replaying the same one.
+ */
+#define SL_SUBG_RX_REARM_JITTER_MIN_MS 250U
+#define SL_SUBG_RX_REARM_JITTER_RANGE_MS 101U /* prime -- see comment above */
+
+static uint32_t s_rx_rearm_jitter_seed;
+
+static uint32_t sl_subg_rx_rearm_ms_jittered(void)
+{
+	uint32_t jitter = (s_rx_rearm_jitter_seed * 73U) % SL_SUBG_RX_REARM_JITTER_RANGE_MS;
+
+	s_rx_rearm_jitter_seed++;
+	return SL_SUBG_RX_REARM_JITTER_MIN_MS + jitter;
+}
 
 static OS_FLAG_GRP s_event_flags;
 
@@ -395,7 +472,7 @@ int sl_subg_radio_init(void)
 	 * reported RSSI is even meaningful in absolute terms before
 	 * suspecting the pump or the antenna.
 	 */
-	printf("radio: RSSI offset = %d dB\r\n", sl_rail_get_rssi_offset(s_rail_handle));
+	dbg_printf("radio: RSSI offset = %d dB\r\n", sl_rail_get_rssi_offset(s_rail_handle));
 
 	/* Static allocation, matching the source's K_SEM_DEFINE-style static
 	 * allocation rather than the heap. Must exist before
@@ -415,7 +492,7 @@ int sl_subg_radio_init(void)
 	 */
 	st = sl_rail_config_rx_data(s_rail_handle, &rx_data_config);
 	if (st != SL_RAIL_STATUS_NO_ERROR) {
-		printf("radio: RX FIFO mode config failed (status 0x%04lx)\r\n",
+		dbg_printf("radio: RX FIFO mode config failed (status 0x%04lx)\r\n",
 		       (unsigned long)st);
 		return -1;
 	}
@@ -437,7 +514,7 @@ int sl_subg_radio_init(void)
 	 * app_init() reaches this function.
 	 */
 	if (sl_subg_set_power_level(13) != 0) {
-		printf("radio: failed to set TX power to +13 dBm\r\n");
+		dbg_printf("radio: failed to set TX power to +13 dBm\r\n");
 		return -1;
 	}
 
@@ -459,7 +536,7 @@ int sl_subg_radio_init(void)
 		uint16_t applied = sl_rail_set_rx_fifo_threshold(s_rail_handle, 1U);
 
 		if (applied != 1U) {
-			printf("radio: RX FIFO threshold got %u, not 1\r\n", applied);
+			dbg_printf("radio: RX FIFO threshold got %u, not 1\r\n", applied);
 		}
 	}
 
@@ -487,6 +564,26 @@ int sl_subg_radio_init(void)
 	 * symbol name -- nothing to call or register here.
 	 */
 
+	/*
+	 * REAL BUG, caught live while verifying the RX frequency sweep: without
+	 * this, s_frequency_channel_config_ready (sl_subg_set_freq()'s own
+	 * lazy-init guard) stays false until AndroidAPS sends its first
+	 * CMD_UPDATE_REG for the frequency registers -- but AndroidAPS's own
+	 * scanForDevice() calls wakeUp() first, which sends its own
+	 * send+listen exchanges *before* the per-candidate-frequency loop
+	 * (with its setBaseFrequency() calls) ever runs. RTT confirmed this
+	 * directly: sl_subg_retune_rx_only() returned -1 on every single
+	 * re-arm of the very first exchanges after a fresh boot, exactly
+	 * matching that guard. Calling sl_subg_set_freq() here with the
+	 * existing built-in default (the same SL_SUBG_FREQ_HZ
+	 * sl_subg_reset_radio_cfg() already uses for CMD_RESET) makes the
+	 * channel config ready from boot, before any host command arrives at
+	 * all -- matching the fact that this exact default is already the
+	 * frequency TX/RX would silently use anyway via the compiled-in
+	 * channelConfigs[0] if nothing had touched it yet.
+	 */
+	(void)sl_subg_set_freq(SL_SUBG_FREQ_HZ);
+
 	return 0;
 }
 
@@ -494,6 +591,26 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
 		     uint16_t repeat_interval_ms)
 {
 	RTOS_ERR err;
+	/*
+	 * REAL GAP, found while investigating why AndroidAPS's real mmtune
+	 * traffic against 560793 kept seeing very few pump replies even after
+	 * every previously-found RX bug was fixed: the diagnostics below were
+	 * gated to i == 0 only ("a genuine failure here is systemic, not a
+	 * one-off worth repeating 200 times over RTT") -- true for a total,
+	 * first-repeat failure, but it means a PARTIAL failure -- some
+	 * fraction of the 200 repeats in a real wake burst silently not
+	 * reaching the air, while the first one succeeds -- was completely
+	 * invisible. This is a Dynamic Multiprotocol build sharing the radio
+	 * with BLE; a connection event landing mid-burst is exactly the kind
+	 * of thing that could cost individual repeats without failing the
+	 * first one. Counting every outcome, not just the first, turns "the
+	 * pump doesn't seem to reply much" from a pump-side assumption into a
+	 * directly checkable bridge-side fact.
+	 */
+	uint16_t tx_fifo_fail_count = 0;
+	uint16_t tx_start_fail_count = 0;
+	uint16_t tx_done_timeout_count = 0;
+	uint16_t tx_ok_count = 0;
 
 	for (uint8_t i = 0; i <= repeat_cnt; i++) {
 		uint16_t fifo_written;
@@ -520,7 +637,7 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
 		 */
 		configured_len = sl_rail_set_fixed_length(s_rail_handle, tx_frame_len);
 		if (configured_len != tx_frame_len) {
-			printf("radio: failed to set TX frame length %u (got %u)\r\n",
+			dbg_printf("radio: failed to set TX frame length %u (got %u)\r\n",
 			       tx_frame_len, configured_len);
 			return -1;
 		}
@@ -545,6 +662,12 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
 		tx_sc = sl_rail_start_tx(s_rail_handle, s_channel,
 					 SL_RAIL_TX_OPTIONS_DEFAULT, &scheduler_info);
 
+		if (fifo_written != tx_frame_len) {
+			tx_fifo_fail_count++;
+		}
+		if (tx_sc != SL_RAIL_STATUS_NO_ERROR) {
+			tx_start_fail_count++;
+		}
 		if (i == 0 && (fifo_written != tx_frame_len || tx_sc != SL_RAIL_STATUS_NO_ERROR)) {
 			/* Permanent checkpoint, not temporary -- see the comment
 			 * above. First repeat only: repeat_cnt can be 200+ (a
@@ -552,7 +675,7 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
 			 * here is systemic, not a one-off worth repeating 200
 			 * times over RTT.
 			 */
-			printf("radio: TX FAILED (fifo %u/%u B written, start_tx status 0x%04lx)\r\n",
+			dbg_printf("radio: TX FAILED (fifo %u/%u B written, start_tx status 0x%04lx)\r\n",
 			       fifo_written, tx_frame_len, (unsigned long)tx_sc);
 		}
 
@@ -570,9 +693,14 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
 				 OS_OPT_PEND_FLAG_SET_ANY | OS_OPT_PEND_FLAG_CONSUME | OS_OPT_PEND_BLOCKING,
 				 NULL, &err);
 
-		if (i == 0 && !s_tx_done) {
-			printf("radio: TX_PACKET_SENT timeout%s\r\n",
-			       s_tx_underflow ? " after TX_UNDERFLOW" : "");
+		if (!s_tx_done) {
+			tx_done_timeout_count++;
+			if (i == 0) {
+				dbg_printf("radio: TX_PACKET_SENT timeout%s\r\n",
+				       s_tx_underflow ? " after TX_UNDERFLOW" : "");
+			}
+		} else {
+			tx_ok_count++;
 		}
 
 		/* Instantaneous TX must yield the shared radio when it completes.
@@ -592,8 +720,164 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
 			OSTimeDly(ms_to_ticks(repeat_interval_ms), OS_OPT_TIME_DLY, &err);
 		}
 	}
+
+	/* Summary for the whole burst, not just repeat 0 -- see this
+	 * function's own comment on why the i == 0-only checks above were not
+	 * enough to catch a partial-burst failure. Only printed when the
+	 * burst was actually large enough for a partial failure to be
+	 * possible/interesting, or when any failure occurred at all, to avoid
+	 * spamming RTT on every single ordinary short command.
+	 */
+	if (repeat_cnt > 0 || tx_fifo_fail_count || tx_start_fail_count || tx_done_timeout_count) {
+		dbg_printf("radio: TX burst done, %u/%u ok (fifo fail %u, start fail %u, "
+		       "TX_PACKET_SENT timeout %u)\r\n",
+		       tx_ok_count, (unsigned)repeat_cnt + 1U,
+		       tx_fifo_fail_count, tx_start_fail_count, tx_done_timeout_count);
+	}
+
 	s_tx_pkt_count++;
 	return 0;
+}
+
+/*
+ * RX frequency sweep, added after live evidence (bench pump 646910 and,
+ * separately, real pump 560793) showed this radio's OOK demodulator has a
+ * genuine, fairly narrow lock margin -- confirmed via a HackRF ground-truth
+ * capture that caught 560793 replying with a real, correctly-decoded
+ * PumpModel payload while AndroidAPS was actively retrying, at the exact
+ * moment this bridge's own receiver, tuned to AndroidAPS's closest
+ * candidate frequency (916.6498 MHz, ~17 kHz from the pump's independently
+ * measured real reply carrier of 916.6667 MHz), reported RX_TIMING_LOST and
+ * zero bytes captured. The channel filter itself is 118.56 kHz wide
+ * (autogen/radioconf_generation_log.json), comfortably wide enough to pass
+ * a 17 kHz offset through -- so the bottleneck is the demodulator's own
+ * symbol-timing lock, not the analog filter, and there is no AFC configured
+ * anywhere in this project's generated RAIL PHY to compensate for it
+ * (searched; no hits). AndroidAPS's own RileyLinkTargetFrequency.kt defines
+ * a fixed 50 kHz-spaced candidate grid (916.45/.50/.55/.60/.65/.70/.75/.80
+ * MHz for the US/CA region) -- half that spacing, 25 kHz, is the worst case
+ * gap between whatever candidate it picks and a real pump's actual carrier,
+ * comfortably wider than the ~17-20 kHz margin this demodulator has already
+ * been shown to need. A dedicated hardware bridge (TI CC1101-based, with
+ * built-in AFC) apparently tolerates AndroidAPS's grid fine; this RAIL-based
+ * OOK PHY does not, which is why this fix belongs here rather than in
+ * AndroidAPS's own frequency table.
+ *
+ * The fix: sweep the RX-only frequency across re-arms, rather than sitting
+ * on one fixed frequency for a whole listen. Offsets start at 0 (try
+ * exactly what was requested first -- preserves today's fast-success
+ * behaviour whenever the requested frequency is already close enough, e.g.
+ * this project's own probe tooling, which empirically calibrates its own
+ * target frequency first) and then alternate outward in 5 kHz steps to
+ * +-25 kHz, covering the full worst-case AAPS candidate-grid gap with room
+ * to spare. TX is deliberately NOT swept -- live evidence already proved TX
+ * at the exact requested frequency reaches and wakes the pump (that is
+ * precisely how the 560793 ground-truth reply above was obtained); only the
+ * LISTEN side needs the wider net.
+ *
+ * REAL BUG IN THIS FIX'S OWN FIRST VERSION, caught by reading AndroidAPS's
+ * actual source (RileyLinkCommunicationManager.kt's scanForDevice()) rather
+ * than continuing to guess from RTT timing: the per-candidate-frequency
+ * listen is NOT the ~25000 ms window this file's other diagnostics happen
+ * to show elsewhere (that number comes from a different AAPS call, the
+ * initial wake) -- scanForDevice() calls transmitThenReceive() with a
+ * listenTimeout of exactly 1250 ms, three tries per frequency, i.e. one
+ * sl_subg_get_pkt() call per try, each only long enough for about four
+ * 300 ms re-arms. The first version of this sweep indexed by rearm_count,
+ * which resets to 0 at the top of every sl_subg_get_pkt() call -- so every
+ * single try, on every frequency, on every retry, only ever reached offsets
+ * table[0..3] (0, +5000, -5000, +10000 Hz) before timing out and starting
+ * over from table[0] again on the next try. +15000/+20000 Hz, right where
+ * 560793's real reply actually sits relative to AndroidAPS's nearest
+ * candidate, was structurally unreachable no matter how many times AAPS
+ * retried. Fixed by making the sweep index a persistent static that keeps
+ * advancing across calls instead of resetting -- three tries of ~4 re-arms
+ * each now covers the entire 11-entry table at least once within a single
+ * frequency's normal scan, and continues advancing (not resetting) if
+ * AndroidAPS moves on to try a different candidate frequency next.
+ *
+ * TEMPORARILY DISABLED, then RE-ENABLED: config/rail/radio_settings.radioconf's
+ * rx_xtal_error_ppm/tx_xtal_error_ppm were raised from 10 to 30 and the radio
+ * profile regenerated (see DEBUGGING_NOTES -- 560793's own reference RFM69
+ * hardware uses a hand-set 400 kHz RXBW with no ppm-budget reasoning at all;
+ * this project's auto-generated OOK profile was instead sized off a 10 ppm
+ * assumption, far tighter than a real pump's ~20-27 ppm-equivalent drift).
+ * That alone widened Acquisition Channel Bandwidth from 118560 Hz to
+ * 191840 Hz. 30 ppm is the practical ceiling here -- 35 ppm and above trips
+ * "WARNING: timing window larger than max allowed 64!" from the radio
+ * configurator, a real BCR timing-recovery hardware limit, not just more
+ * margin, so it was not pushed further.
+ *
+ * The sweep was disabled on the reasoning that the wider passband alone
+ * should cover the full range below -- but live testing at 30 ppm still
+ * showed only a PARTIAL reception of a real 560793 reply (14 of 71 B, then
+ * RX_TIMING_LOST) at a moment precisely correlated (via HackRF ground
+ * truth + AndroidAPS's own logged BLE timestamps) to fall well inside the
+ * expected listen window, ruling out a timing/overlap explanation. That
+ * signature -- initial lock acquired, then lost partway through a longer
+ * frame -- points at the BCR loop's *sustained* tracking margin, not just
+ * its initial acquisition range, and residual offset within the wider
+ * passband can still be large enough to matter there even though
+ * acquisition itself now succeeds. Re-enabled on top of the wider filter
+ * (not instead of it) on the reasoning that the two are complementary: the
+ * wider passband makes every swept offset lower-risk to sit on, and
+ * whichever re-arms land closest to zero residual offset during a
+ * longer-frame attempt have the best chance of sustaining lock through the
+ * whole frame, which a single fixed center (even now a wide-enough one)
+ * cannot guarantee on its own.
+ */
+static const int32_t s_rx_sweep_offsets_hz[] = {
+	0, 5000, -5000, 10000, -10000, 15000, -15000, 20000, -20000, 25000, -25000
+};
+#define SL_SUBG_RX_SWEEP_COUNT \
+	(sizeof(s_rx_sweep_offsets_hz) / sizeof(s_rx_sweep_offsets_hz[0]))
+/* Persists across sl_subg_get_pkt() calls deliberately -- see the comment
+ * above. Not reset anywhere; free-running for the life of the firmware.
+ */
+static uint32_t s_rx_sweep_index;
+
+/* Offset that actually produced the most recent successful reception, tried
+ * FIRST on every subsequent call instead of always starting at a fixed
+ * offset -- see sl_subg_get_pkt()'s own comment on why the first re-arm of
+ * a short single-shot command is the only one with a real chance of
+ * catching a freshly-woken pump's reply. A fixed guess (e.g. always 0) is
+ * wrong for whichever pump/crystal combination does not happen to sit near
+ * nominal -- any pump can be on any offset within this table, 646910 in
+ * this session's own bench setup included; nothing here is 646910-specific
+ * or guaranteed to still be true after a re-tune or a different pump.
+ * Adapting to the last offset that actually worked, instead of asserting
+ * one, is the only form of this that stays correct in general. Starts at 0
+ * (nominal) before any success has been observed this boot, same as
+ * before.
+ */
+static int32_t s_rx_last_good_offset_hz;
+
+/*
+ * Deliberately separate from the public sl_subg_set_freq(): that function
+ * also updates s_frequency_hz, the frequency APS/AndroidAPS actually asked
+ * for and which the next sl_subg_send_pkt() (a retry, or any TX at all)
+ * must keep using unchanged. This helper only ever retunes the live RAIL
+ * channel config for the RX side; sl_subg_get_pkt() is responsible for
+ * putting the real s_frequency_hz value back before it returns by any path,
+ * success or not, so a subsequent TX is never accidentally sent on a swept
+ * offset. Silently no-ops (returns -1) if sl_subg_set_freq() has never run
+ * yet at all -- s_frequency_channel_config_ready false -- which in practice
+ * does not happen before a real listen, since every command path that
+ * reaches sl_subg_get_pkt() runs apply_pending_freq() (aps.c), and thus
+ * sl_subg_set_freq(), first.
+ */
+static int sl_subg_retune_rx_only(uint32_t hz)
+{
+	sl_rail_status_t st;
+
+	if (!s_frequency_channel_config_ready) {
+		return -1;
+	}
+	s_frequency_channel_entry.baseFrequency = hz;
+	st = sl_rail_config_channels(s_rail_handle,
+				     (const sl_rail_channel_config_t *)(const void *)&s_frequency_channel_config,
+				     sl_rail_util_on_channel_config_change);
+	return (st == SL_RAIL_STATUS_NO_ERROR) ? 0 : -1;
 }
 
 enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t timeout_ms)
@@ -607,13 +891,57 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 	 * alongside the re-arm loop below; kept even though the loop itself
 	 * turned out to be the real fix (see that comment), since it is
 	 * still correct guidance for the DMP scheduler and cheap to keep.
+	 *
+	 * REAL BUG, found by directly comparing this against sl_subg_send_pkt()'s
+	 * own scheduler_info: priority here was 200 (per sl_rail_scheduler_info_t's
+	 * own documented scale, 0 highest / 255 lowest -- near the bottom), while
+	 * TX uses 100. There was never a stated reason RX should be that much
+	 * more preemptable than TX in the same exchange, and live evidence shows
+	 * this actually costing completed receptions: with the RX filter/BCR
+	 * fixes already in place, a real 560793 reply captured 14 of its 71
+	 * bytes before RX_TIMING_LOST -- a partial-then-lost pattern consistent
+	 * with DMP preempting an in-progress reception for a BLE connection
+	 * event partway through. A 71-byte frame (~35 ms on air, this radio's
+	 * own RX_FIFO threshold is 1 byte -- see sl_subg_radio_init() -- so the
+	 * ISR runs on every single byte, ~71 times for one frame) has far more
+	 * exposure to that than a 7-byte frame (~5 ms, a handful of ISR runs).
+	 * TX, at priority 100, was directly measured at 201/201 successful
+	 * completions in a real AndroidAPS wake burst (RTT: "TX burst done,
+	 * 201/201 ok") -- a priority already proven not to starve BLE in
+	 * practice. Matching RX to that same, already-safe value closes the
+	 * asymmetry rather than guessing at a new number.
 	 */
 	const sl_rail_scheduler_info_t scheduler_info = {
-		.priority = 200,
+		.priority = 100,
 		.transaction_time = (((uint32_t)SL_SUBG_MAX_PKT_LEN * 8U + SL_SUBG_PREAMBLE_SYNC_BITS)
 				     * 1000000U / SL_SUBG_BITRATE_BPS)
 				    + SL_SUBG_RX_MARGIN_US,
 	};
+	/* Per-re-arm printf (one for the sweep retune, one for the RX outcome)
+	 * used to fire on every single re-arm -- at SL_SUBG_RX_REARM_MS=300 ms
+	 * that's ~4 re-arms for AndroidAPS's 1250 ms scan tries and ~80 for its
+	 * 25000 ms wakeUp(), each producing up to two printf calls. This was
+	 * live-confirmed to be enough RTT traffic to break the debug connection
+	 * itself: `commander rtt connect --noreset` died with "ERROR: Could not
+	 * write data to target" every single time, always specifically during
+	 * this loop's printf bursts and never during quiet stretches -- ruled
+	 * out as EM2/EM3 deep sleep (still happened with EM1 forced, blocking
+	 * deep sleep entirely) and as a blocking printf stall (this project's
+	 * IOSTREAM_RTT_UP_MODE is SEGGER_RTT_MODE_NO_BLOCK_TRIM, so printf can
+	 * never block target execution regardless of host drain rate) -- but
+	 * flaky RTT capture during exactly the windows this investigation most
+	 * needs visibility into (e.g. the actual RX outcome during a scan's
+	 * later frequencies) is a real problem on its own regardless of root
+	 * cause. Fixed by accumulating outcome counters through the loop and
+	 * printing one summary line per sl_subg_get_pkt() call instead, same
+	 * pattern already used for sl_subg_send_pkt()'s "TX burst done" line.
+	 */
+	unsigned sweep_fail_count = 0;
+	unsigned data_rearms = 0;
+	unsigned quiet_rearms = 0;
+	uint64_t error_events_accum = 0;
+	uint8_t max_rx_count_seen = 0;
+	int16_t last_rssi_q = INT16_MIN;
 
 	if (has_deadline) {
 		err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
@@ -645,6 +973,11 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 	for (;;) {
 		OS_FLAGS bits;
 		OS_TICK wait_ticks;
+		/* Set below, in the sweep-offset block; read back after a
+		 * successful reception to update s_rx_last_good_offset_hz. Scoped
+		 * to the whole iteration (not just that block) for that reason.
+		 */
+		int32_t sweep_offset_hz;
 
 		if (has_deadline) {
 			OS_TICK now;
@@ -652,12 +985,19 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 			err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
 			now = OSTimeGet(&err);
 			if (now >= deadline_tick) {
+				(void)sl_subg_retune_rx_only(s_frequency_hz);
+				dbg_printf("radio: RX call summary: %u re-arms (%u sweep-fail, "
+				       "%u data/error, %u quiet), error events 0x%016llx, "
+				       "max %u B captured, last rssi %d dBm -> TIMEOUT\r\n",
+				       rearm_count, sweep_fail_count, data_rearms, quiet_rearms,
+				       (unsigned long long)error_events_accum, max_rx_count_seen,
+				       (last_rssi_q == INT16_MIN) ? 0 : last_rssi_q / 4);
 				return SL_SUBG_RX_TIMEOUT;
 			}
 
 			{
 				OS_TICK remaining = deadline_tick - now;
-				OS_TICK rearm_ticks = ms_to_ticks(SL_SUBG_RX_REARM_MS);
+				OS_TICK rearm_ticks = ms_to_ticks(sl_subg_rx_rearm_ms_jittered());
 
 				wait_ticks = (remaining < rearm_ticks) ? remaining : rearm_ticks;
 			}
@@ -666,7 +1006,7 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 			 * periodically rather than blocking on one RX call forever,
 			 * for the same reason as the bounded case above.
 			 */
-			wait_ticks = ms_to_ticks(SL_SUBG_RX_REARM_MS);
+			wait_ticks = ms_to_ticks(sl_subg_rx_rearm_ms_jittered());
 		}
 
 		s_rx_count = 0;
@@ -687,22 +1027,37 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 		(void)OSFlagPost(&s_event_flags, SL_SUBG_EVT_RX_DATA, OS_OPT_POST_FLAG_CLR, &err);
 
 		/*
-		 * Settling delay before arming RX. Every single call into this
-		 * function in this protocol is immediately preceded by our own
-		 * sl_subg_send_pkt() burst -- CMD_SEND_AND_LISTEN transmits, then
-		 * listens, by design -- so a PA ringdown / antenna-switch / AGC
-		 * settling transient at TX-to-RX turnaround gets a chance to decay
-		 * before RAIL starts trying to demodulate anything. Neither the
-		 * transaction_time fix, the re-arm loop, nor the FIFO reset above
-		 * changed the observed ~30-36 B phantom-capture signature at all
-		 * (identical byte counts across three independent live bench-pump
-		 * tests with each fix in isolation) -- ruling out DMP scheduling
-		 * and stale FIFO content, and pointing at something generated
-		 * fresh at arm time instead. This is the next candidate; not yet
-		 * confirmed.
+		 * Settling delay before arming RX -- FIRST RE-ARM ONLY. Originally
+		 * ran on every single re-arm; the PA ringdown / antenna-switch / AGC
+		 * settling reasoning below is specifically about TX-to-RX turnaround,
+		 * which only actually happens once per sl_subg_get_pkt() call (right
+		 * after our own sl_subg_send_pkt() burst) -- every re-arm after the
+		 * first is re-arming a radio that was already idle from the PREVIOUS
+		 * re-arm, not fresh off a transmit, so the same justification does
+		 * not apply there. Found while auditing this loop against
+		 * AndroidAPS's own fixed, un-adjustable listen windows (scanForDevice()
+		 * uses exactly 1250 ms per try -- see aps.c/DEBUGGING_NOTES): paying
+		 * this 50 ms on every re-arm was costing up to ~150 ms of actual
+		 * listening time out of a 1250 ms budget (3 of ~4 re-arms), and
+		 * because the deadline check above happens before this delay, it was
+		 * also making the whole call overrun what the caller actually asked
+		 * for by the same amount, re-arm after re-arm. Skipping it after the
+		 * first re-arm recovers that time without touching the original
+		 * turnaround reasoning at all.
+		 *
+		 * PA ringdown / antenna-switch / AGC settling transient at TX-to-RX
+		 * turnaround gets a chance to decay before RAIL starts trying to
+		 * demodulate anything. Neither the transaction_time fix, the re-arm
+		 * loop, nor the FIFO reset above changed the observed ~30-36 B
+		 * phantom-capture signature at all (identical byte counts across
+		 * three independent live bench-pump tests with each fix in
+		 * isolation) -- ruling out DMP scheduling and stale FIFO content,
+		 * and pointing at something generated fresh at arm time instead.
 		 */
-		err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
-		OSTimeDly(ms_to_ticks(50U), OS_OPT_TIME_DLY, &err);
+		if (rearm_count == 0) {
+			err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+			OSTimeDly(ms_to_ticks(50U), OS_OPT_TIME_DLY, &err);
+		}
 
 		/*
 		 * Also never done before this session -- the legacy RFM69 port's
@@ -724,10 +1079,67 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 		 */
 		(void)sl_rail_reset_fifo(s_rail_handle, false, true);
 
+		/* RX frequency sweep -- see sl_subg_retune_rx_only()'s own comment
+		 * and s_rx_sweep_index's own comment on why this index persists
+		 * across calls instead of restarting at table[0] every time:
+		 * AndroidAPS's real scanForDevice() gives each frequency only
+		 * three 1250 ms tries (~4 re-arms each), so a per-call index would
+		 * never reach this table's outer entries at all. Post-incremented
+		 * so consecutive re-arms (within one call, and across separate
+		 * calls) keep moving through the table rather than repeating.
+		 */
+		/*
+		 * FIRST RE-ARM OF EVERY CALL TRIES s_rx_last_good_offset_hz --
+		 * the offset that last actually worked -- INSTEAD OF drawing from
+		 * the persistent sweep index. Found while investigating why 646910
+		 * still failed most single-shot commands (isDeviceReachable,
+		 * getBasalProfile, getPumpHistory) even right after a confirmed
+		 * wake: AndroidAPS's own follow-up commands are single-shot
+		 * (repeatCnt=0, no internal retry) with a short (~2 s) listen
+		 * window, so only the FIRST re-arm has a real chance of catching a
+		 * freshly-woken pump's immediate reply, and with the sweep
+		 * unconditionally consuming the persistent index on every re-arm,
+		 * that first re-arm only had a 1-in-SL_SUBG_RX_SWEEP_COUNT chance
+		 * of landing on the offset this particular pump/crystal actually
+		 * needs. An EARLIER version of this fix hardcoded that first re-arm
+		 * to offset 0 on the reasoning that every clean 646910 decode this
+		 * session had landed there -- WRONG: those decodes came from a
+		 * HackRF capture at a fixed wideband center frequency, independent
+		 * of this driver's own re-arm/offset state, so they say nothing
+		 * about which of OUR offsets is correct, and any pump can in
+		 * general sit at any offset in this table (560793 already does, at
+		 * +15-20 kHz). Asserting a fixed offset is never correct in
+		 * general; adapting to whichever offset last actually produced a
+		 * reception is. Re-arms after the first still draw from the
+		 * persistent sweep index exactly as before, so a still-unknown
+		 * offset keeps getting discovered over a longer call.
+		 */
+		{
+			int sweep_rc;
+
+			if (rearm_count == 0) {
+				sweep_offset_hz = s_rx_last_good_offset_hz;
+			} else {
+				sweep_offset_hz = s_rx_sweep_offsets_hz[s_rx_sweep_index % SL_SUBG_RX_SWEEP_COUNT];
+				s_rx_sweep_index++;
+			}
+			sweep_rc = sl_subg_retune_rx_only(s_frequency_hz + (uint32_t)sweep_offset_hz);
+			if (sweep_rc != 0) {
+				sweep_fail_count++;
+			}
+		}
+
 		rail_status = sl_rail_start_rx(s_rail_handle, s_channel, &scheduler_info);
 		if (rail_status != SL_RAIL_STATUS_NO_ERROR) {
-			printf("radio: start_rx failed (status 0x%04lx)\r\n",
+			dbg_printf("radio: start_rx failed (status 0x%04lx)\r\n",
 			       (unsigned long)rail_status);
+			(void)sl_subg_retune_rx_only(s_frequency_hz);
+			dbg_printf("radio: RX call summary: %u re-arms (%u sweep-fail, "
+			       "%u data/error, %u quiet), error events 0x%016llx, "
+			       "max %u B captured, last rssi %d dBm -> TIMEOUT\r\n",
+			       rearm_count, sweep_fail_count, data_rearms, quiet_rearms,
+			       (unsigned long long)error_events_accum, max_rx_count_seen,
+			       (last_rssi_q == INT16_MIN) ? 0 : last_rssi_q / 4);
 			return SL_SUBG_RX_TIMEOUT;
 		}
 
@@ -830,52 +1242,21 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 				s_last_rssi_dbm = rssi / 4;
 			}
 
-			/* Logged here (task context, safe to printf) rather than
-			 * from sl_rail_util_on_event() (ISR context, where repeated
-			 * printf during an actual incoming packet could itself
-			 * perturb the timing this is trying to diagnose). A nonzero
-			 * error-events value with a truncated byte count is the DMP
-			 * protocol-switch signature (see s_rx_error_events' own
-			 * declaration); this now also logs which re-arm iteration
-			 * produced it, since that distinguishes "stuck on the very
-			 * first attempt" from "intermittently stuck partway through
-			 * the listen."
-			 *
-			 * RSSI logged while gathering real calibration data for a
-			 * future RSSI/carrier-sense based termination scheme (see
-			 * DEBUGGING_NOTES_2026-09-23.md Follow-up 6's "Next steps").
-			 * Logged on every re-arm, not just ones with captured bytes,
-			 * specifically to also capture quiet-channel/noise-floor
-			 * baseline samples for comparison -- a real squelch
-			 * threshold needs both. Values are quarter-dBm (divide by 4
-			 * for dBm) per sl_rail_get_rssi()'s own documented units.
+			/* Per-re-arm detail (byte count, error-event bitmask,
+			 * error-time RSSI) folded into the accumulators below
+			 * instead of printed here -- see this function's own
+			 * banner comment on why per-re-arm printf was replaced
+			 * with one summary line per call.
 			 */
+			last_rssi_q = rssi;
+			error_events_accum |= s_rx_error_events;
+			if (s_rx_count > max_rx_count_seen) {
+				max_rx_count_seen = s_rx_count;
+			}
 			if (s_rx_error_events != 0 || s_rx_count != 0) {
-				/* error_rssi is the RSSI the ISR captured at the moment
-				 * the first RX error/timing event fired this iteration
-				 * (see sl_rail_util_on_event()'s own comment) -- distinct
-				 * from end-of-slice rssi above, and the more meaningful
-				 * of the two for a zero-byte failure, since those never
-				 * extend the grace period and so leave a wide gap between
-				 * the event and the end-of-slice read. INT16_MIN means no
-				 * error event fired this iteration (e.g. s_rx_count != 0
-				 * from a clean receive, no error path taken at all).
-				 */
-				printf("radio: RX re-arm %u ended with %u B captured, "
-				       "error events 0x%016llx, rssi %d (%d dBm), "
-				       "error-time rssi %d dBm\r\n",
-				       rearm_count, s_rx_count,
-				       (unsigned long long)s_rx_error_events, rssi, rssi / 4,
-				       (int)s_rx_error_rssi_dbm);
-			} else if ((rearm_count % 20U) == 1U) {
-				/* Sparse baseline sample -- every 20th empty re-arm
-				 * (roughly every 6 s at the 300 ms interval), not
-				 * every single one, to avoid RTT spam over a long
-				 * listen window while still getting real noise-floor
-				 * data points across the whole session.
-				 */
-				printf("radio: RX re-arm %u quiet, rssi %d (%d dBm)\r\n",
-				       rearm_count, rssi, rssi / 4);
+				data_rearms++;
+			} else {
+				quiet_rearms++;
 			}
 		}
 
@@ -887,15 +1268,36 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 		 * instant, same contract subg_get_pkt() had with abort_flag.
 		 */
 		if (s_abort_flag) {
+			(void)sl_subg_retune_rx_only(s_frequency_hz);
+			dbg_printf("radio: RX call summary: %u re-arms (%u sweep-fail, "
+			       "%u data/error, %u quiet), error events 0x%016llx, "
+			       "max %u B captured, last rssi %d dBm -> INTERRUPTED\r\n",
+			       rearm_count, sweep_fail_count, data_rearms, quiet_rearms,
+			       (unsigned long long)error_events_accum, max_rx_count_seen,
+			       (last_rssi_q == INT16_MIN) ? 0 : last_rssi_q / 4);
 			return SL_SUBG_RX_INTERRUPTED;
 		}
 		if (s_rx_have_data && s_rx_count != 0) {
+			/* Remember the offset this reception actually happened on, so
+			 * the next call's first (highest-value) re-arm starts here
+			 * instead of guessing -- see s_rx_last_good_offset_hz's own
+			 * comment.
+			 */
+			s_rx_last_good_offset_hz = sweep_offset_hz;
 			break;
 		}
 		/* Nothing usable this iteration -- loop back, re-check the
 		 * deadline, and re-arm for another slice.
 		 */
 	}
+
+	/* Sweep restored to the actual requested frequency now that a real
+	 * reception ended this listen -- see sl_subg_retune_rx_only()'s own
+	 * comment. Harmless if this particular successful re-arm happened to
+	 * land on offset 0 already (retuning to the same frequency again is a
+	 * no-op as far as the radio is concerned).
+	 */
+	(void)sl_subg_retune_rx_only(s_frequency_hz);
 
 	/* s_last_rssi_dbm was already captured above, before this successful
 	 * iteration's sl_rail_idle() call -- see that block's own comment for
@@ -905,6 +1307,12 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 	memcpy(buf, s_rx_buf, s_rx_count);
 	*len = s_rx_count;
 	s_rx_pkt_count++;
+	dbg_printf("radio: RX call summary: %u re-arms (%u sweep-fail, %u data/error, "
+	       "%u quiet), error events 0x%016llx, max %u B captured, "
+	       "last rssi %d dBm -> OK, %u B\r\n",
+	       rearm_count, sweep_fail_count, data_rearms, quiet_rearms,
+	       (unsigned long long)error_events_accum, max_rx_count_seen,
+	       (last_rssi_q == INT16_MIN) ? 0 : last_rssi_q / 4, s_rx_count);
 	return SL_SUBG_RX_OK;
 }
 
