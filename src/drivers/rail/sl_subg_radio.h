@@ -149,6 +149,14 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
 enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len,
 				       uint32_t timeout_ms);
 
+/**
+ * @brief Confirm the last sl_subg_get_pkt() reception was the packet the
+ * caller wanted, letting its RX offset seed the next call's first re-arm.
+ * Receptions not accepted (e.g. another pump's traffic) leave the adaptive
+ * offset untouched.
+ */
+void sl_subg_accept_last_rx(void);
+
 /** @brief Interrupt an in-progress sl_subg_get_pkt() from another context. */
 void sl_subg_abort(void);
 void sl_subg_clear_abort(void);

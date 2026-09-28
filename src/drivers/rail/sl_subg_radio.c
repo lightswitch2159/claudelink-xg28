@@ -125,6 +125,33 @@ static sl_rail_handle_t s_rail_handle;
  */
 #define SL_SUBG_RX_GRACE_MS           150U
 
+/* RX priority while a frame is in progress -- above the RAIL 16-32 window
+ * the Bluetooth controller maps all of its tasks into. See
+ * sl_rail_util_on_event()'s SYNC_0_DETECT handling.
+ */
+#define SL_SUBG_RX_ACTIVE_PRIORITY    10U
+
+/* Length of the boosted first re-arm after a TX -- see sl_subg_get_pkt(). */
+#define SL_SUBG_RX_FIRST_SLICE_MS     200U
+
+/*
+ * How long s_rx_last_good_offset_hz is trusted for the first re-arm of a
+ * call before falling back to the normal sweep table instead. Added after
+ * live dbg_log evidence: a clean 13-in-a-row streak of instant (1 re-arm)
+ * successes at one offset, immediately followed by a run of failures whose
+ * re-arms landed on visibly DIFFERENT offsets -- consistent with the
+ * pump/board crystal genuinely drifting (thermal drift is a known property
+ * of low-cost crystals) rather than any code bug. Without this, the
+ * highest-value first re-arm of every subsequent call keeps retrying an
+ * offset that has since drifted wrong, wasting the one attempt most likely
+ * to matter for a short single-shot command. 5 minutes is arbitrary but
+ * generous relative to how quickly a crystal's temperature (and therefore
+ * its ppm error) actually changes in a stationary bench setup; short
+ * enough that a real, still-current good offset does not go stale between
+ * uses.
+ */
+#define SL_SUBG_RX_OFFSET_STALE_MS    (5U * 60U * 1000U)
+
 /*
  * REAL BUG, FOUND AGAINST A PRODUCTION BRIDGE'S wakeUp() PHASE: HackRF ground
  * truth during a live AndroidAPS wakeUp() call (25000 ms listen) showed the
@@ -202,6 +229,23 @@ static OS_TICK ms_to_ticks(uint32_t ms)
 	return (OS_TICK)(((uint64_t)ms * rate_hz) / 1000U);
 }
 
+/* True if @p set_tick is recent enough (within SL_SUBG_RX_OFFSET_STALE_MS)
+ * to still be trusted for the first-re-arm offset guess -- see that
+ * define's own comment. Self-contained RTOS_ERR handling (own local err,
+ * freshly initialized) rather than reusing a caller's, so this is safe to
+ * call from anywhere without assumptions about the caller's own err state.
+ */
+static bool offset_is_fresh(OS_TICK set_tick)
+{
+	RTOS_ERR err;
+	OS_TICK now;
+
+	err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+	now = OSTimeGet(&err);
+
+	return (OS_TICK)(now - set_tick) < ms_to_ticks(SL_SUBG_RX_OFFSET_STALE_MS);
+}
+
 /* TX/RX FIFO buffers. sl_rail_set_tx_fifo()/sl_rail_set_rx_fifo() take a
  * sl_rail_fifo_buffer_align_t* (sl_rail_types.h: typedef uint32_t
  * sl_rail_fifo_buffer_align_t), not a bare uint8_t* the way the RAIL_*
@@ -234,6 +278,20 @@ static volatile sl_rail_events_t s_rx_error_events;
  * must not be confused with "no error event happened").
  */
 static volatile int16_t s_rx_error_rssi_dbm = INT16_MIN;
+/*
+ * RSSI of the packet currently being received, sampled in the ISR on its
+ * first RX_FIFO_ALMOST_FULL -- mid-packet, radio guaranteed still in RX.
+ * The end-of-slice read can't be used for a completed packet: by the time
+ * the task wakes, RAIL has already left RX and returns SL_RAIL_RSSI_INVALID
+ * (-128 dBm). That made every successful reply report the same RSSI, which
+ * blinded AndroidAPS's scanForDevice() -- it picks the tuned frequency by
+ * best reply RSSI, so it could not find the pump's actual carrier and left
+ * replies landing off-center, where most of them lose timing mid-frame.
+ */
+static volatile int16_t s_rx_pkt_rssi_dbm = INT16_MIN;
+/* RAIL-time (us) of the first/last byte drained this re-arm -- diagnostic. */
+static volatile sl_rail_time_t s_rx_first_byte_us;
+static volatile sl_rail_time_t s_rx_last_byte_us;
 static int16_t s_last_rssi_dbm = INT16_MIN;
 static uint16_t s_rx_pkt_count;
 static uint16_t s_tx_pkt_count;
@@ -283,6 +341,24 @@ void sl_rail_util_on_event(sl_rail_handle_t handle, sl_rail_events_t events)
 	RTOS_ERR err;
 
 	/*
+	 * A frame is now arriving: lift this receive above every BLE task for
+	 * the rest of it (sl_rail_set_task_priority()'s own documented use
+	 * case). The Bluetooth controller maps all of its link-layer priorities
+	 * into RAIL 16-32 (sl_btctrl_scheduler_priority_config.h RAIL_WINDOW),
+	 * far above our 100, so a connection event falling due mid-frame
+	 * preempted it silently -- the cause of ReadHistoryData's page reply
+	 * dying at byte 94 of 107 on every retry: the pump answers late enough
+	 * that its frame straddles the next 200 ms connection event, while the
+	 * HackRF showed the full frame on air. The next re-arm's
+	 * sl_rail_start_rx() restores the normal priority, so BLE loses at most
+	 * one connection event per received frame.
+	 */
+	if (events & SL_RAIL_EVENT_RX_SYNC_0_DETECT) {
+		(void)sl_rail_set_task_priority(handle, SL_SUBG_RX_ACTIVE_PRIORITY,
+						SL_RAIL_TASK_TYPE_START_RX);
+	}
+
+	/*
 	 * REAL BUG, CAUGHT ON LIVE HARDWARE, NOT A GUESS: this receive already
 	 * completed (terminator seen, or buffer full) for the current
 	 * sl_subg_get_pkt() call, but s_rx_have_data only resets at the START
@@ -299,6 +375,13 @@ void sl_rail_util_on_event(sl_rail_handle_t handle, sl_rail_events_t events)
 	 * silently corrupted by trailing garbage after arrival.
 	 */
 	if ((events & SL_RAIL_EVENT_RX_FIFO_ALMOST_FULL) && !s_rx_have_data) {
+		if (s_rx_count == 0 && s_rx_pkt_rssi_dbm == INT16_MIN) {
+			int16_t rssi = sl_rail_get_rssi(handle, SL_RAIL_GET_RSSI_NO_WAIT);
+
+			if (rssi != SL_RAIL_RSSI_INVALID) {
+				s_rx_pkt_rssi_dbm = (int16_t)(rssi / 4);
+			}
+		}
 		while (s_rx_count < SL_SUBG_MAX_PKT_LEN) {
 			uint8_t byte;
 			uint16_t got = sl_rail_read_rx_fifo(handle, &byte, 1);
@@ -312,6 +395,10 @@ void sl_rail_util_on_event(sl_rail_handle_t handle, sl_rail_events_t events)
 				rx_done = true;
 				break;
 			}
+			if (s_rx_count == 0) {
+				s_rx_first_byte_us = sl_rail_get_time(handle);
+			}
+			s_rx_last_byte_us = sl_rail_get_time(handle);
 			s_rx_buf[s_rx_count++] = byte;
 		}
 
@@ -418,6 +505,26 @@ void sl_rail_util_on_event(sl_rail_handle_t handle, sl_rail_events_t events)
 						| SL_RAIL_EVENT_RX_FRAME_ERROR
 						| SL_RAIL_EVENT_RX_FIFO_OVERFLOW
 						| SL_RAIL_EVENT_RX_TIMING_LOST);
+
+		/*
+		 * RX_TIMING_LOST specifically means RAIL has already given up on
+		 * this reception (demod lock broken mid-frame) -- there is nothing
+		 * left to catch in the remainder of this slice. The main loop's
+		 * OSFlagPend() otherwise sits out the rest of the fixed
+		 * SL_SUBG_RX_REARM_MS (~300 ms) window before re-arming, which live
+		 * data shows is the dominant failure signature (13/15 timeouts in
+		 * one sampled window carried this bit). Wake it immediately so the
+		 * sweep can retune and re-arm right away instead of burning that
+		 * dead time. Safe to post the same flag sl_subg_get_pkt() uses for
+		 * real completions: s_rx_have_data is untouched here, so that
+		 * function's own completion check (s_rx_have_data && s_rx_count)
+		 * correctly treats this as "nothing usable yet, loop back and
+		 * re-arm" rather than a false success -- see its comment just after
+		 * the grace-period block.
+		 */
+		if (events & SL_RAIL_EVENT_RX_TIMING_LOST) {
+			(void)OSFlagPost(&s_event_flags, SL_SUBG_EVT_RX_DATA, OS_OPT_POST_FLAG_SET, &err);
+		}
 	}
 }
 
@@ -551,11 +658,11 @@ int sl_subg_radio_init(void)
 				   SL_RAIL_EVENT_RX_FIFO_ALMOST_FULL | SL_RAIL_EVENT_TX_PACKET_SENT
 				   | SL_RAIL_EVENT_TX_UNDERFLOW | SL_RAIL_EVENT_RX_PACKET_ABORTED
 				   | SL_RAIL_EVENT_RX_FRAME_ERROR | SL_RAIL_EVENT_RX_FIFO_OVERFLOW
-				   | SL_RAIL_EVENT_RX_TIMING_LOST,
+				   | SL_RAIL_EVENT_RX_TIMING_LOST | SL_RAIL_EVENT_RX_SYNC_0_DETECT,
 				   SL_RAIL_EVENT_RX_FIFO_ALMOST_FULL | SL_RAIL_EVENT_TX_PACKET_SENT
 				   | SL_RAIL_EVENT_TX_UNDERFLOW | SL_RAIL_EVENT_RX_PACKET_ABORTED
 				   | SL_RAIL_EVENT_RX_FRAME_ERROR | SL_RAIL_EVENT_RX_FIFO_OVERFLOW
-				   | SL_RAIL_EVENT_RX_TIMING_LOST);
+				   | SL_RAIL_EVENT_RX_TIMING_LOST | SL_RAIL_EVENT_RX_SYNC_0_DETECT);
 	if (st != SL_STATUS_OK) {
 		return -1;
 	}
@@ -617,8 +724,15 @@ int sl_subg_send_pkt(const uint8_t *data, uint8_t len, uint8_t repeat_cnt,
 		uint16_t tx_frame_len = (uint16_t)len + 1U;
 		uint8_t tx_data[SL_SUBG_MAX_PKT_LEN + 1U];
 		sl_rail_status_t tx_sc;
+		/* A single frame (a command, ACK or args frame, <= ~65 ms) runs
+		 * above BLE: at a 15-30 ms connection interval a normal-priority
+		 * frame was preempted before it ever went out (live: "0/1 ok,
+		 * TX_PACKET_SENT timeout"), so the pump never heard the command.
+		 * Repeated wake bursts stay at 100 -- they can last seconds, BLE
+		 * interleaves between repeats, and they already complete 201/201.
+		 */
 		sl_rail_scheduler_info_t scheduler_info = {
-			.priority = 100,
+			.priority = (repeat_cnt == 0) ? SL_SUBG_RX_ACTIVE_PRIORITY : 100,
 			.slip_time = SL_SUBG_TX_SLIP_TIME_US,
 			.transaction_time = (((uint32_t)tx_frame_len * 8U + SL_SUBG_PREAMBLE_SYNC_BITS)
 					     * 1000000U / SL_SUBG_BITRATE_BPS)
@@ -853,6 +967,37 @@ static uint32_t s_rx_sweep_index;
 static int32_t s_rx_last_good_offset_hz;
 
 /*
+ * OS tick timestamp of the reception that set s_rx_last_good_offset_hz --
+ * see SL_SUBG_RX_OFFSET_STALE_MS below for why this exists.
+ */
+static OS_TICK s_rx_last_good_offset_tick;
+static bool s_rx_have_last_good_offset;
+
+/*
+ * Offset of the most recent reception, held back until the caller confirms
+ * the packet was actually the one it was listening for
+ * (sl_subg_accept_last_rx()). Committing on every reception let a nearby
+ * second pump's traffic pull s_rx_last_good_offset_hz toward that pump's
+ * crystal offset, making the next attempt at the addressed pump less likely
+ * to land.
+ */
+static int32_t s_rx_pending_offset_hz;
+static bool s_rx_have_pending_offset;
+
+void sl_subg_accept_last_rx(void)
+{
+	RTOS_ERR err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+
+	if (!s_rx_have_pending_offset) {
+		return;
+	}
+	s_rx_last_good_offset_hz = s_rx_pending_offset_hz;
+	s_rx_last_good_offset_tick = OSTimeGet(&err);
+	s_rx_have_last_good_offset = true;
+	s_rx_have_pending_offset = false;
+}
+
+/*
  * Deliberately separate from the public sl_subg_set_freq(): that function
  * also updates s_frequency_hz, the frequency APS/AndroidAPS actually asked
  * for and which the next sl_subg_send_pkt() (a retry, or any TX at all)
@@ -887,6 +1032,17 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 	const bool has_deadline = (timeout_ms != 0);
 	OS_TICK deadline_tick = 0;
 	unsigned rearm_count = 0;
+	/* Offset of the most recent re-arm attempt (0 until the first re-arm
+	 * actually happens) -- logged alongside RSSI in the RX call summary
+	 * below to check whether RSSI swings at a fixed physical position
+	 * correlate with which sweep offset happened to be tuned at read time,
+	 * rather than a real change in received signal strength. Deliberately
+	 * separate from the loop-scoped sweep_offset_hz (which is set INSIDE
+	 * the loop body, after the deadline check that can exit before any
+	 * re-arm happens this iteration) so every exit path has a defined,
+	 * meaningful value to report instead of an uninitialized one.
+	 */
+	int32_t last_tried_offset_hz = 0;
 	/* transaction_time sized for one full max-length frame -- fixed
 	 * alongside the re-arm loop below; kept even though the loop itself
 	 * turned out to be the real fix (see that comment), since it is
@@ -911,10 +1067,22 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 	 * practice. Matching RX to that same, already-safe value closes the
 	 * asymmetry rather than guessing at a new number.
 	 */
+	/*
+	 * transaction_time covers the whole listening window (longest jittered
+	 * re-arm slice plus the in-progress-frame grace), not one frame. Sized to
+	 * one frame, the DMP scheduler considered RX finished ~57 ms after each
+	 * re-arm and let a pending BLE connection event take the radio -- cutting
+	 * any reply that arrived later in the slice. Live-confirmed: every
+	 * ReadHistoryData page reply (the pump reads flash first, so it answers
+	 * later than other reads) cut at exactly byte 94 of 107 with
+	 * RX_TIMING_LOST, clean 4b6b up to the cut, identical on every retry
+	 * because each retry starts on a BLE write and so lands at the same phase
+	 * relative to the next connection event.
+	 */
 	const sl_rail_scheduler_info_t scheduler_info = {
 		.priority = 100,
-		.transaction_time = (((uint32_t)SL_SUBG_MAX_PKT_LEN * 8U + SL_SUBG_PREAMBLE_SYNC_BITS)
-				     * 1000000U / SL_SUBG_BITRATE_BPS)
+		.transaction_time = (SL_SUBG_RX_REARM_JITTER_MIN_MS + SL_SUBG_RX_REARM_JITTER_RANGE_MS
+				     + SL_SUBG_RX_GRACE_MS) * 1000U
 				    + SL_SUBG_RX_MARGIN_US,
 	};
 	/* Per-re-arm printf (one for the sweep retune, one for the RX outcome)
@@ -941,6 +1109,17 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 	unsigned quiet_rearms = 0;
 	uint64_t error_events_accum = 0;
 	uint8_t max_rx_count_seen = 0;
+	/* Head of the longest partial capture this call -- dumped on timeout to
+	 * tell a real reply cut off mid-frame from noise or another device.
+	 */
+	static uint8_t partial_head[SL_SUBG_MAX_PKT_LEN];
+	sl_rail_time_t arm_us = 0, idle_us = 0;
+	bool grace_used = false;
+	/* Timing of the re-arm that produced partial_head (us, relative to arm). */
+	long d_first = 0, d_last = 0, d_idle = 0;
+	bool d_grace = false;
+	sl_rail_events_t d_events = 0;
+	uint8_t partial_head_len = 0;
 	int16_t last_rssi_q = INT16_MIN;
 
 	if (has_deadline) {
@@ -988,10 +1167,21 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 				(void)sl_subg_retune_rx_only(s_frequency_hz);
 				dbg_printf("radio: RX call summary: %u re-arms (%u sweep-fail, "
 				       "%u data/error, %u quiet), error events 0x%016llx, "
-				       "max %u B captured, last rssi %d dBm -> TIMEOUT\r\n",
+				       "max %u B captured, last rssi %d dBm, offset %ld Hz -> TIMEOUT\r\n",
 				       rearm_count, sweep_fail_count, data_rearms, quiet_rearms,
 				       (unsigned long long)error_events_accum, max_rx_count_seen,
-				       (last_rssi_q == INT16_MIN) ? 0 : last_rssi_q / 4);
+				       (last_rssi_q == INT16_MIN) ? 0 : last_rssi_q / 4,
+				       (long)last_tried_offset_hz);
+				if (partial_head_len != 0) {
+					static char hex[sizeof(partial_head) * 2 + 1];
+
+					for (uint8_t i = 0; i < partial_head_len; i++) {
+						snprintf(&hex[i * 2], 3, "%02x", partial_head[i]);
+					}
+					dbg_printf("radio: longest partial head: %s\r\n", hex);
+					dbg_printf("radio: partial timing us: first %ld last %ld idle %ld grace %d ev 0x%08lx\r\n",
+						   d_first, d_last, d_idle, (int)d_grace, (unsigned long)d_events);
+				}
 				return SL_SUBG_RX_TIMEOUT;
 			}
 
@@ -1009,10 +1199,22 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 			wait_ticks = ms_to_ticks(sl_subg_rx_rearm_ms_jittered());
 		}
 
+		/* First re-arm = the window the reply is expected in; it runs at
+		 * boosted priority (see start_rx below), so keep it short.
+		 */
+		if (rearm_count == 0) {
+			OS_TICK first_ticks = ms_to_ticks(SL_SUBG_RX_FIRST_SLICE_MS);
+
+			if (wait_ticks > first_ticks) {
+				wait_ticks = first_ticks;
+			}
+		}
+
 		s_rx_count = 0;
 		s_rx_have_data = false;
 		s_rx_error_events = 0;
 		s_rx_error_rssi_dbm = INT16_MIN;
+		s_rx_pkt_rssi_dbm = INT16_MIN;
 
 		/* Clear stale bits from a previous iteration/call before arming --
 		 * mirrors subg_get_pkt()'s k_sem_reset(&dio1_sem) "clear any edge
@@ -1054,9 +1256,15 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 		 * isolation) -- ruling out DMP scheduling and stale FIFO content,
 		 * and pointing at something generated fresh at arm time instead.
 		 */
+		/* Was 50 ms. The pump starts its reply ~40 ms after our TX ends
+		 * for a data read (HackRF-measured) and sooner for a bare ACK, so
+		 * 50 ms left long replies barely caught and ACK-only exchanges
+		 * (SetRealTimeClock, ReadHistoryData's first step, every set
+		 * command) never caught at all. 2 ms still covers PA ramp-down.
+		 */
 		if (rearm_count == 0) {
 			err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
-			OSTimeDly(ms_to_ticks(50U), OS_OPT_TIME_DLY, &err);
+			OSTimeDly(ms_to_ticks(2U), OS_OPT_TIME_DLY, &err);
 		}
 
 		/*
@@ -1117,7 +1325,8 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 		{
 			int sweep_rc;
 
-			if (rearm_count == 0) {
+			if (rearm_count == 0 && s_rx_have_last_good_offset
+			    && offset_is_fresh(s_rx_last_good_offset_tick)) {
 				sweep_offset_hz = s_rx_last_good_offset_hz;
 			} else {
 				sweep_offset_hz = s_rx_sweep_offsets_hz[s_rx_sweep_index % SL_SUBG_RX_SWEEP_COUNT];
@@ -1127,19 +1336,41 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 			if (sweep_rc != 0) {
 				sweep_fail_count++;
 			}
+			last_tried_offset_hz = sweep_offset_hz;
 		}
 
-		rail_status = sl_rail_start_rx(s_rail_handle, s_channel, &scheduler_info);
+		arm_us = sl_rail_get_time(s_rail_handle);
+		grace_used = false;
+		/*
+		 * The first re-arm follows our own TX, so it's when the reply
+		 * arrives (measured: ACK ~41 ms, data ~55-77 ms after TX, every
+		 * frame done by ~140 ms). At normal priority, BLE connection events
+		 * (RAIL 16-32) landing in the reply's preamble -- before
+		 * SYNC_0_DETECT can boost it -- lose the frame outright; at a
+		 * 15-30 ms connection interval that is most replies. Boost this
+		 * window only; it is capped at SL_SUBG_RX_FIRST_SLICE_MS (+grace
+		 * if a frame is mid-flight), so BLE loses at most ~350 ms.
+		 */
+		{
+			sl_rail_scheduler_info_t si = scheduler_info;
+
+			if (rearm_count == 0) {
+				si.priority = SL_SUBG_RX_ACTIVE_PRIORITY;
+				si.transaction_time = (SL_SUBG_RX_FIRST_SLICE_MS + SL_SUBG_RX_GRACE_MS) * 1000U;
+			}
+			rail_status = sl_rail_start_rx(s_rail_handle, s_channel, &si);
+		}
 		if (rail_status != SL_RAIL_STATUS_NO_ERROR) {
 			dbg_printf("radio: start_rx failed (status 0x%04lx)\r\n",
 			       (unsigned long)rail_status);
 			(void)sl_subg_retune_rx_only(s_frequency_hz);
 			dbg_printf("radio: RX call summary: %u re-arms (%u sweep-fail, "
 			       "%u data/error, %u quiet), error events 0x%016llx, "
-			       "max %u B captured, last rssi %d dBm -> TIMEOUT\r\n",
+			       "max %u B captured, last rssi %d dBm, offset %ld Hz -> TIMEOUT\r\n",
 			       rearm_count, sweep_fail_count, data_rearms, quiet_rearms,
 			       (unsigned long long)error_events_accum, max_rx_count_seen,
-			       (last_rssi_q == INT16_MIN) ? 0 : last_rssi_q / 4);
+			       (last_rssi_q == INT16_MIN) ? 0 : last_rssi_q / 4,
+			       (long)last_tried_offset_hz);
 			return SL_SUBG_RX_TIMEOUT;
 		}
 
@@ -1174,6 +1405,7 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 		 * share of extra time.
 		 */
 		if (RTOS_ERR_CODE_GET(err) == RTOS_ERR_TIMEOUT && s_rx_count > 0) {
+			grace_used = true;
 			OS_TICK grace_deadline;
 
 			err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
@@ -1222,6 +1454,7 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 		{
 			int16_t rssi = sl_rail_get_rssi(s_rail_handle, SL_RAIL_GET_RSSI_NO_WAIT);
 
+			idle_us = sl_rail_get_time(s_rail_handle);
 			(void)sl_rail_idle(s_rail_handle, SL_RAIL_IDLE, true);
 			rearm_count++;
 
@@ -1240,6 +1473,10 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 				 * DEBUGGING_NOTES_2026-09-23.md from earlier probe output.
 				 */
 				s_last_rssi_dbm = rssi / 4;
+				if (s_rx_pkt_rssi_dbm != INT16_MIN) {
+					s_last_rssi_dbm = s_rx_pkt_rssi_dbm;
+					rssi = (int16_t)(s_rx_pkt_rssi_dbm * 4);
+				}
 			}
 
 			/* Per-re-arm detail (byte count, error-event bitmask,
@@ -1252,6 +1489,14 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 			error_events_accum |= s_rx_error_events;
 			if (s_rx_count > max_rx_count_seen) {
 				max_rx_count_seen = s_rx_count;
+				partial_head_len = (s_rx_count < sizeof(partial_head))
+						   ? s_rx_count : (uint8_t)sizeof(partial_head);
+				memcpy(partial_head, s_rx_buf, partial_head_len);
+				d_first = (long)(s_rx_first_byte_us - arm_us);
+				d_last = (long)(s_rx_last_byte_us - arm_us);
+				d_idle = (long)(idle_us - arm_us);
+				d_grace = grace_used;
+				d_events = s_rx_error_events;
 			}
 			if (s_rx_error_events != 0 || s_rx_count != 0) {
 				data_rearms++;
@@ -1271,19 +1516,20 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 			(void)sl_subg_retune_rx_only(s_frequency_hz);
 			dbg_printf("radio: RX call summary: %u re-arms (%u sweep-fail, "
 			       "%u data/error, %u quiet), error events 0x%016llx, "
-			       "max %u B captured, last rssi %d dBm -> INTERRUPTED\r\n",
+			       "max %u B captured, last rssi %d dBm, offset %ld Hz -> INTERRUPTED\r\n",
 			       rearm_count, sweep_fail_count, data_rearms, quiet_rearms,
 			       (unsigned long long)error_events_accum, max_rx_count_seen,
-			       (last_rssi_q == INT16_MIN) ? 0 : last_rssi_q / 4);
+			       (last_rssi_q == INT16_MIN) ? 0 : last_rssi_q / 4,
+			       (long)last_tried_offset_hz);
 			return SL_SUBG_RX_INTERRUPTED;
 		}
 		if (s_rx_have_data && s_rx_count != 0) {
-			/* Remember the offset this reception actually happened on, so
-			 * the next call's first (highest-value) re-arm starts here
-			 * instead of guessing -- see s_rx_last_good_offset_hz's own
-			 * comment.
+			/* Held pending, not committed: only becomes the next call's
+			 * first-re-arm offset once the caller confirms this was the
+			 * addressed pump -- see sl_subg_accept_last_rx().
 			 */
-			s_rx_last_good_offset_hz = sweep_offset_hz;
+			s_rx_pending_offset_hz = sweep_offset_hz;
+			s_rx_have_pending_offset = true;
 			break;
 		}
 		/* Nothing usable this iteration -- loop back, re-check the
@@ -1309,10 +1555,11 @@ enum sl_subg_rx_status sl_subg_get_pkt(uint8_t *buf, uint8_t *len, uint32_t time
 	s_rx_pkt_count++;
 	dbg_printf("radio: RX call summary: %u re-arms (%u sweep-fail, %u data/error, "
 	       "%u quiet), error events 0x%016llx, max %u B captured, "
-	       "last rssi %d dBm -> OK, %u B\r\n",
+	       "last rssi %d dBm, offset %ld Hz -> OK, %u B\r\n",
 	       rearm_count, sweep_fail_count, data_rearms, quiet_rearms,
 	       (unsigned long long)error_events_accum, max_rx_count_seen,
-	       (last_rssi_q == INT16_MIN) ? 0 : last_rssi_q / 4, s_rx_count);
+	       (last_rssi_q == INT16_MIN) ? 0 : last_rssi_q / 4,
+	       (long)last_tried_offset_hz, s_rx_count);
 	return SL_SUBG_RX_OK;
 }
 

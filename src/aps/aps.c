@@ -552,6 +552,7 @@ static void cmd_get_pkt(const uint8_t *p, uint16_t len)
 		return;
 	}
 
+	sl_subg_accept_last_rx();
 	dec_len = decode(raw, dec, raw_len);
 	APS_LOG_INF("send+listen: REPLY %u B raw -> %u B decoded", raw_len, dec_len);
 	APS_LOG_HEXDUMP_INF(dec, dec_len, "pump reply");
@@ -597,6 +598,84 @@ static void cmd_send_pkt(const uint8_t *p, uint16_t len)
 	respond_code(APS_RESP_SUCCESS);
 }
 
+#define MDT_PKT_TYPE_PUMP   0xA7U
+#define MDT_ADDR_LEN        4U   /* packet type + 3-byte device serial */
+
+static OS_TICK aps_ms_to_ticks(uint32_t ms)
+{
+	RTOS_ERR err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+	OS_RATE_HZ hz = OSTimeTickRateHzGet(&err);
+
+	if (hz == 0) {
+		return (OS_TICK)ms;
+	}
+	return (OS_TICK)(((uint64_t)ms * hz) / 1000U);
+}
+
+static uint32_t aps_ticks_to_ms(OS_TICK ticks)
+{
+	RTOS_ERR err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+	OS_RATE_HZ hz = OSTimeTickRateHzGet(&err);
+
+	if (hz == 0) {
+		return (uint32_t)ticks;
+	}
+	return (uint32_t)(((uint64_t)ticks * 1000U) / hz);
+}
+
+/*
+ * Listen for a reply from the device @p addr (packet type + serial, taken
+ * from the packet the host just asked us to send -- never configured here;
+ * the serial is whatever pump the host is set up for). A well-formed
+ * Medtronic frame from a DIFFERENT device -- another pump nearby, or another
+ * controller talking to its own pump -- is dropped and listening continues
+ * for the rest of @p timeout, instead of being handed to the host as if it
+ * were the reply. Anything that doesn't decode as a Medtronic header at all
+ * is passed through unchanged, so the host's own validation still sees it.
+ * @p addr NULL disables filtering (payload isn't a Medtronic pump packet).
+ */
+static enum sl_subg_rx_status listen_for_reply(const uint8_t *addr, uint32_t timeout,
+					       uint8_t *raw, uint8_t *raw_len,
+					       uint8_t *dec, uint16_t *dec_len)
+{
+	RTOS_ERR err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+	const OS_TICK deadline = OSTimeGet(&err) + aps_ms_to_ticks(timeout);
+	uint32_t remaining = timeout;
+	enum sl_subg_rx_status st;
+
+	for (;;) {
+		st = sl_subg_get_pkt(raw, raw_len, remaining);
+		if (st != SL_SUBG_RX_OK) {
+			return st;
+		}
+
+		*dec_len = decode(raw, dec, *raw_len);
+
+		if (addr == NULL || *dec_len < MDT_ADDR_LEN || dec[0] != MDT_PKT_TYPE_PUMP
+		    || memcmp(dec, addr, MDT_ADDR_LEN) == 0) {
+			sl_subg_accept_last_rx();
+			return SL_SUBG_RX_OK;
+		}
+
+		APS_LOG_INF("send+listen: dropped frame from %02x%02x%02x, waiting for %02x%02x%02x",
+			    dec[1], dec[2], dec[3], addr[1], addr[2], addr[3]);
+
+		if (timeout != 0) {
+			OS_TICK now;
+
+			err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+			now = OSTimeGet(&err);
+			if ((int32_t)(deadline - now) <= 0) {
+				return SL_SUBG_RX_TIMEOUT;
+			}
+			remaining = aps_ticks_to_ms(deadline - now);
+			if (remaining == 0) {
+				return SL_SUBG_RX_TIMEOUT;
+			}
+		}
+	}
+}
+
 /*
  * CMD_SEND_AND_LISTEN:
  * [sendChan][repeatCnt][repeatIntvl BE16][listenChan][listenTimeout BE32]
@@ -635,14 +714,20 @@ static void cmd_send_and_listen(const uint8_t *p, uint16_t len)
 	APS_LOG_INF("send+listen: %u B payload -> %u B encoded, listen %u ms, retries %u",
 		    (unsigned)payload_len, (unsigned)enc_len, (unsigned)timeout, (unsigned)retry_cnt);
 
+	/* Address to expect the reply from: copied out of the host's own
+	 * outgoing packet, so it's always the pump the host is configured for.
+	 */
+	const uint8_t *addr = (payload_len >= MDT_ADDR_LEN && p[12] == MDT_PKT_TYPE_PUMP)
+			      ? &p[12] : NULL;
+
 	sl_subg_send_pkt(enc, (uint8_t)enc_len, repeat_cnt, repeat_intvl);
-	st = sl_subg_get_pkt(raw, &raw_len, timeout);
+	st = listen_for_reply(addr, timeout, raw, &raw_len, dec, &dec_len);
 
 	/* Retry loop: resend with repeatCnt forced to 0, as in legacy. */
 	while (st == SL_SUBG_RX_TIMEOUT && retry_cnt > 0) {
 		APS_LOG_DBG("send-and-listen retry, %u left", retry_cnt);
 		sl_subg_send_pkt(enc, (uint8_t)enc_len, 0, repeat_intvl);
-		st = sl_subg_get_pkt(raw, &raw_len, timeout);
+		st = listen_for_reply(addr, timeout, raw, &raw_len, dec, &dec_len);
 		retry_cnt--;
 	}
 
@@ -652,7 +737,6 @@ static void cmd_send_and_listen(const uint8_t *p, uint16_t len)
 		return;
 	}
 
-	dec_len = decode(raw, dec, raw_len);
 	APS_LOG_INF("send+listen: REPLY %u B raw -> %u B decoded", raw_len, dec_len);
 	APS_LOG_HEXDUMP_INF(dec, dec_len, "pump reply");
 	respond_rx_packet(dec, dec_len);

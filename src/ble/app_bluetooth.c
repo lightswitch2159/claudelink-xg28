@@ -65,6 +65,9 @@
 #include "debug/dbg_log.h"
 #include "aps_transport.h"
 
+#include "os.h"
+#include "rtos_err.h"
+
 /* The advertising set handle allocated from the Bluetooth stack. */
 static uint8_t advertising_set_handle = 0xff;
 
@@ -88,6 +91,15 @@ static uint8_t active_connection = SL_BT_INVALID_CONNECTION_HANDLE;
  * repo for the full handshake description this implements.
  */
 static uint8_t response_count;
+
+/*
+ * Timestamp (OS ticks) of the most recently sent response, kept so
+ * aps_transport_send() can detect a second response following too closely
+ * behind the first -- see that function's own comment for the bug this
+ * guards against.
+ */
+static OS_TICK s_last_send_tick;
+static bool s_have_last_send_tick;
 
 /*
  * Explicit advertising/scan-response data, not
@@ -232,8 +244,17 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
 		 * sl_bt_evt_connection_parameters_id below logs what was
 		 * actually negotiated -- the peer can still reject/renegotiate.
 		 */
+		/*
+		 * SUPERSEDED: the 200 ms request above is no longer needed and
+		 * made every host exchange slow -- each ATT operation waits for a
+		 * connection event, and a CMD_SEND_AND_LISTEN is a 3-op long write
+		 * plus a ~6-op long read of the reply at the default 23 B MTU, so
+		 * ~2.8 s per history frame. In-progress sub-GHz frames are now
+		 * protected from BLE preemption directly (SYNC_0_DETECT priority
+		 * boost in sl_subg_radio.c), so request a normal 15-30 ms interval.
+		 */
 		(void)sl_bt_connection_set_parameters(active_connection,
-						       160, 160, 0, 3000, 0, 0xffff);
+						       12, 24, 0, 600, 0, 0xffff);
 		break;
 
 	/* Logs what sl_bt_connection_set_parameters() above actually got --
@@ -330,6 +351,19 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
 					gattdb_ips_data, 0, sizeof(full),
 					&full_len, full);
 				app_assert_status(sc);
+
+				/* On execute the stack emits one event PER queued
+				 * chunk, every one flagged execute_write_request.
+				 * Dispatching on each enqueued the same command
+				 * once per chunk -- a 21 B CMD_SEND_AND_LISTEN ran
+				 * twice, the duplicate's response answered the
+				 * host's NEXT command, and the backlog filled the
+				 * APS queue. Only the chunk that ends the write
+				 * completes it.
+				 */
+				if ((size_t)v->offset + v->value.len < full_len) {
+					break;
+				}
 				cmd_data = full;
 				cmd_len = (uint16_t)full_len;
 			}
@@ -398,6 +432,33 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
 	}
 }
 
+static OS_TICK ms_to_ticks(uint32_t ms)
+{
+	RTOS_ERR err;
+	OS_RATE_HZ rate_hz;
+
+	if (ms == 0) {
+		return 0;
+	}
+
+	err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+	rate_hz = OSTimeTickRateHzGet(&err);
+	if (RTOS_ERR_CODE_GET(err) != RTOS_ERR_NONE || rate_hz == 0) {
+		return (OS_TICK)ms;   /* best-effort fallback, not a verified rate */
+	}
+
+	return (OS_TICK)(((uint64_t)ms * rate_hz) / 1000U);
+}
+
+/*
+ * Minimum spacing enforced between two consecutive responses -- see the
+ * comment block on aps_transport_send() below for the bug this guards
+ * against. Chosen as comfortably larger than the notify-to-read round trip
+ * seen in live AndroidAPS logs (tens of ms), without adding meaningful
+ * latency to a command sequence that isn't racing anything.
+ */
+#define APS_MIN_RESPONSE_SPACING_MS   40U
+
 /*
  * aps_transport_send() -- strong override of the weak no-op default in
  * aps_transport.c (src/aps/). Implements the legacy handshake exactly, per
@@ -412,6 +473,34 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
  * mirrors the legacy firmware's own
  * `if (ble_ips_data_send(...) == NRF_SUCCESS) { ble_ips_response_cnt_notify(...); }`
  * gate, reproduced here as the sl_status_t check below.
+ *
+ * REAL BUG FOUND ON LIVE HARDWARE: gattdb_ips_data is a single-slot mailbox
+ * -- this function has no visibility into whether AndroidAPS has actually
+ * read the PREVIOUS value before a second call overwrites it with a new
+ * one. Confirmed via AndroidAPS's own log: a real multi-byte
+ * CMD_SEND_AND_LISTEN reply (Response Count N) was immediately followed by
+ * CMD_UPDATE_REG's bare one-byte ack (APS_RESP_SUCCESS, 0xDD -- see aps.c
+ * respond_code()/cmd_update_reg(), and note CMD_UPDATE_REG runs inline, not
+ * through the normal command queue, specifically so a retune isn't delayed
+ * behind other work). AndroidAPS's RFSpyReader.coalesceOverwritten() even
+ * detected the skip ("Response Count went N -> N+1... only the newest is
+ * still available") and read the newest value anyway -- which is why the
+ * BLE characteristic read came back as the single byte 0xDD instead of the
+ * real pump reply: the ack had already clobbered it. This is a distinct
+ * failure mode from anything RF-side (RX_TIMING_LOST etc.) -- a real,
+ * successfully-received pump reply thrown away purely by transport timing.
+ *
+ * A real fix (queuing unread responses) needs a way to know when the
+ * client has actually consumed the previous value, which this transport
+ * doesn't have (gattdb_ips_data is a plain read, not a user-read-request
+ * the stack notifies this code about). Short of that, enforce a minimum
+ * spacing between consecutive sends -- delaying this response until enough
+ * time has passed since the last one gives AndroidAPS's poll loop a real
+ * chance to read the prior value first. Safe to block here: aps_transport_
+ * send() runs on the dedicated APS task (aps_task_fn, via aps_put_cmd()'s
+ * queue -- see aps.c), never inline in the Bluetooth stack's own event
+ * task, so this does not stall BLE event processing the way it would if
+ * called from sl_bt_on_event() directly.
  */
 void aps_transport_send(const uint8_t *data, uint16_t len)
 {
@@ -426,9 +515,36 @@ void aps_transport_send(const uint8_t *data, uint16_t len)
 		return;
 	}
 
+	if (s_have_last_send_tick) {
+		RTOS_ERR err;
+		OS_TICK now, elapsed, min_ticks;
+
+		err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+		now = OSTimeGet(&err);
+		elapsed = now - s_last_send_tick;   /* wraps correctly: unsigned */
+		min_ticks = ms_to_ticks(APS_MIN_RESPONSE_SPACING_MS);
+
+		if (elapsed < min_ticks) {
+			err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+			OSTimeDly(min_ticks - elapsed, OS_OPT_TIME_DLY, &err);
+		}
+	}
+
 	sc = sl_bt_gatt_server_write_attribute_value(gattdb_ips_data, 0, len, data);
 	if (sc != SL_STATUS_OK) {
 		return;
+	}
+
+	/* Recorded now, right after the write that actually lands in the
+	 * mailbox -- not at function entry -- so the spacing above measures
+	 * from the moment a value became readable, including any delay this
+	 * same call just spent waiting.
+	 */
+	{
+		RTOS_ERR err = (RTOS_ERR)RTOS_ERR_INIT_CODE(RTOS_ERR_NONE);
+
+		s_last_send_tick = OSTimeGet(&err);
+		s_have_last_send_tick = true;
 	}
 
 	/* Wrap 0x00-0xFE, never 0xFF -- legacy semantics (see the field
